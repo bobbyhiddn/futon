@@ -2,7 +2,7 @@
 
 # futon
 
-Text in, vectors out. futon runs embedding models inside your Go program: pure Go, no CGO, no sidecar, no network.
+Text in, vectors out. futon runs embedding models inside your Go program: pure Go, no CGO, no sidecar, and no network at embed time.
 
 It is a library, not a server and not an LLM runtime. It does one job, turning text into vectors with BERT-family encoders, so applications can add vector search, clustering or memory without shipping or managing a separate embedding service.
 
@@ -10,18 +10,16 @@ It is a library, not a server and not an LLM runtime. It does one job, turning t
 - **Pure Go.** No CGO anywhere in the dependency tree (CI enforces it), so cross-compiling is `GOOS=... go build`. AVX2/FMA kernels on amd64, NEON on arm64, a portable fallback everywhere else.
 - **Faithful.** The tokenizer matches the Hugging Face reference id for id, and vectors match the reference implementation at cosine >= 0.9999 (typically >= 0.999999) on a corpus of prose, code, accents, CJK, emoji and edge cases. Output is bit-deterministic at any thread count.
 - **Bring your own model.** Any plain BERT encoder works once packed (see [docs/packs.md](docs/packs.md)); three popular models are tested out of the box.
-- **Careful with weights.** Packs are sha256-verified at install and again at load, installed atomically, and never fetched over the network by the library.
+- **Careful with weights.** Packs are sha256-verified at install and again at load and installed atomically. The embedder never touches the network; downloading is a separate, optional step (`hub` package, `futon packs pull`).
 
 ## Try it in a minute
 
-You need Go 1.23+ and Python 3.10+ (Python is only used once, to turn a Hugging Face model into a pack).
+You need Go 1.23+. No Python.
 
 ```
-git clone https://github.com/bobbyhiddn/futon && cd futon
-pip install huggingface_hub safetensors numpy zstandard
-python scripts/build-weight-pack.py --model bge     # downloads ~130 MB, writes a 67 MB pack to ~/.futon/models
-go run ./cmd/futon embed "hello world"              # prints a 384-number vector
-go run ./cmd/futon packs list
+go install github.com/bobbyhiddn/futon/cmd/futon@latest
+futon packs pull bge-small-en-v1.5     # 61 MB, checksum-verified, installed to ~/.futon/models
+futon embed "hello world"              # prints a 384-number vector
 ```
 
 Then in your own program: `go get github.com/bobbyhiddn/futon` and see below.
@@ -46,9 +44,12 @@ e.ModelName()  // "native/bge-small-en-v1.5": store this next to every vector
 
 `CosineSimilarity`, `Serialize` and `Deserialize` are included for the common ranking and storage steps. futon deliberately has no index or database: use whatever store you already have.
 
-A model is a *weight pack*, a directory under `~/.futon/models` (override with `Options.ModelsDir` or `FUTON_HOME`). Build one from Hugging Face with `scripts/build-weight-pack.py` (see above).
+A model is a *weight pack*, a directory under `~/.futon/models` (override with `Options.ModelsDir` or `FUTON_HOME`). Get one by:
 
-The pack is yours: futon does not host or distribute weights. See [docs/packs.md](docs/packs.md) for the other built-in models, for packing any BERT-style model, and for sharing packs between machines.
+- `futon packs pull <id>` for the [hosted models](MODELS.md) (MIT and Apache-2.0 models published by others, redistributed with their licenses and provenance). In Go, `hub.Pull(ctx, id, hub.Options{ModelsDir: dir})` does the same with progress reporting.
+- building any plain BERT model yourself with `scripts/build-weight-pack.py`; see [docs/packs.md](docs/packs.md), which also covers checking a pack against the reference and sharing packs between machines.
+
+The embedder itself never downloads anything: an application that ships its own weights carries no network code.
 
 ## Models
 
@@ -69,6 +70,8 @@ Speed depends on your CPU. On a 16-thread Windows machine bge-small embeds a mix
 go install github.com/bobbyhiddn/futon/cmd/futon@latest
 
 futon embed -model bge-small-en-v1.5 "some text" "more text"   # one JSON vector per line
+futon packs available                    # models hosted for download
+futon packs pull bge-small-en-v1.5       # download, verify, install
 futon packs list
 futon packs verify bge-small-en-v1.5
 futon packs install my-model.futonw      # from an archive made by the build script
@@ -95,9 +98,11 @@ futon is not the first Go library to run embedding models locally. Pick the one 
 |---|---|
 | `/` | `Embedder`, `Options`, `New`, vector helpers |
 | `native/` | the engine: tokenizer, safetensors, kernels, model |
-| `packs/` | pack install, verify, list |
+| `packs/` | pack install, verify, list (offline) |
+| `hub/` | optional: download hosted packs with checksum verification |
 | `cmd/futon` | command-line tool |
 | `scripts/` | pack builder, pack checker, fixture generator |
+| `MODELS.md` | hosted models: upstream, revision, license, checksum |
 | `docs/` | [pack guide](docs/packs.md), [design notes](docs/design.md), [comparison](docs/comparison.md) |
 
 ## Testing
@@ -115,4 +120,4 @@ Requires Go 1.23 or newer.
 
 ## License
 
-MIT. Weight packs are built from upstream models under their own licenses (recorded in each pack's `LICENSE` and `manifest.json`); check them before redistributing packs.
+MIT for the code. Weight packs are converted copies of models published by others, under their own licenses (recorded in each pack's `LICENSE` and `manifest.json`, summarized in [MODELS.md](MODELS.md)); check them before redistributing packs.

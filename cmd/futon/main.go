@@ -1,6 +1,8 @@
 // Command futon embeds text with a local weight pack and manages packs.
 //
 //	futon embed [-model id] [-models-dir dir] [-dims n] [text ...]
+//	futon packs available [-source url]
+//	futon packs pull [-models-dir dir] [-source url] <id> ...
 //	futon packs list [-models-dir dir]
 //	futon packs verify [-models-dir dir] <id>
 //	futon packs install [-models-dir dir] [-force] <archive.futonw>
@@ -21,6 +23,7 @@ import (
 	"os/signal"
 
 	"github.com/bobbyhiddn/futon"
+	"github.com/bobbyhiddn/futon/hub"
 	"github.com/bobbyhiddn/futon/packs"
 )
 
@@ -51,6 +54,8 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   futon embed [-model id] [-models-dir dir] [-dims n] [text ...]
+  futon packs available [-source url]
+  futon packs pull [-models-dir dir] [-source url] <id> ...
   futon packs list [-models-dir dir]
   futon packs verify [-models-dir dir] <id>
   futon packs install [-models-dir dir] [-force] <archive.futonw>
@@ -113,6 +118,7 @@ func cmdPacks(args []string) error {
 	fs := flag.NewFlagSet("packs "+args[0], flag.ExitOnError)
 	modelsDir := fs.String("models-dir", "", "directory holding packs (default "+futon.DefaultModelsDir()+")")
 	force := fs.Bool("force", false, "replace an already installed pack")
+	source := fs.String("source", "", "directory URL to download packs from (default: the hosted models, see MODELS.md)")
 	fs.Parse(args[1:])
 	dir := *modelsDir
 	if dir == "" {
@@ -120,6 +126,27 @@ func cmdPacks(args []string) error {
 	}
 
 	switch args[0] {
+	case "available":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		models, err := hub.Available(ctx, hub.Options{BaseURL: *source})
+		if err != nil {
+			return err
+		}
+		for _, m := range models {
+			fmt.Println(m.ID)
+		}
+	case "pull":
+		if fs.NArg() == 0 {
+			return errors.New("packs pull: name at least one pack (see: futon packs available)")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		for _, id := range fs.Args() {
+			if err := pullOne(ctx, id, dir, *source); err != nil {
+				return err
+			}
+		}
 	case "list":
 		infos, err := packs.List(dir)
 		if err != nil {
@@ -167,5 +194,33 @@ func cmdPacks(args []string) error {
 		usage()
 		return fmt.Errorf("packs: unknown subcommand %q", args[0])
 	}
+	return nil
+}
+
+// pullOne downloads and installs one pack, reporting progress on stderr.
+func pullOne(ctx context.Context, id, modelsDir, source string) error {
+	lastPct := -1
+	_, err := hub.Pull(ctx, id, hub.Options{
+		ModelsDir: modelsDir,
+		BaseURL:   source,
+		Progress: func(done, total int64) {
+			if total <= 0 {
+				return
+			}
+			if pct := int(done * 100 / total); pct != lastPct && pct%5 == 0 {
+				lastPct = pct
+				fmt.Fprintf(os.Stderr, "\r%s: %3d%% of %.0f MB", id, pct, float64(total)/1e6)
+			}
+		},
+	})
+	fmt.Fprintln(os.Stderr)
+	var already *packs.AlreadyInstalledError
+	if errors.As(err, &already) {
+		return fmt.Errorf("%s is already installed with different contents; remove it first to replace it", id)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed %s in %s\n", id, modelsDir)
 	return nil
 }

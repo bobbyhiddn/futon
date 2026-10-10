@@ -1,6 +1,6 @@
 # Weight packs
 
-futon runs *weight packs*: a model's tensors, vocabulary and a manifest, converted once into a directory futon can load and verify. futon never downloads weights itself and does not host any; you build packs from the upstream models you choose.
+futon runs *weight packs*: a model's tensors, vocabulary and a manifest, converted once into a directory futon can load and verify. You can download the [hosted models](../MODELS.md) with `futon packs pull`, or build a pack from any plain BERT model yourself. The embedder never downloads anything; only the optional `hub` package and the command-line tool do.
 
 ## Pack format
 
@@ -17,7 +17,18 @@ The pack id is the directory name and the value of `Options.Model`. The default 
 
 At load futon checks every file against `manifest.json` (sha256 and size) and the exact tensor-name set. A missing manifest, a changed byte or an unknown tensor is a loud error, never a silently different model.
 
-## Build the built-in models
+## Download a hosted model
+
+```
+futon packs available                   # what is hosted
+futon packs pull bge-small-en-v1.5      # download, verify the sha256, install
+```
+
+`pull` fetches `<id>.futonw` and `weights-checksums.txt` from the release listed in [MODELS.md](../MODELS.md), checks the archive against the manifest before unpacking anything, then installs it atomically. `-source URL` points it at any other host with the same layout (a mirror, an internal server).
+
+From Go: `hub.Pull(ctx, id, hub.Options{ModelsDir: dir, Progress: fn})`. The `hub` package is the only code in futon that uses the network.
+
+## Build the built-in models yourself
 
 ```
 pip install huggingface_hub safetensors numpy zstandard

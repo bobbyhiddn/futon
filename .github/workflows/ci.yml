@@ -93,3 +93,31 @@ jobs:
         env:
           FUTON_NATIVE_TEST_MODELS: ${{ github.workspace }}/models
         run: go test -count=1 -run 'Parity|BatchMatchesSingle' -v ./native
+
+  hosted:
+    name: hosted model (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: pull the hosted bge-small pack
+        shell: bash
+        run: |
+          go build -o futon ./cmd/futon
+          ./futon packs available
+          ./futon packs pull -models-dir models bge-small-en-v1.5
+          ./futon packs verify -models-dir models bge-small-en-v1.5
+      - name: embed with the hosted pack
+        shell: bash
+        run: ./futon embed -models-dir models "hello world" | head -c 80
+      - name: parity against the reference vectors
+        shell: bash
+        env:
+          FUTON_NATIVE_TEST_MODELS: ${{ github.workspace }}/models
+        run: go test -count=1 -run 'ParityRealWeightsBGE' -v ./native

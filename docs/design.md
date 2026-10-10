@@ -6,7 +6,7 @@ A sidecar daemon is a hard runtime dependency with its own failure modes (stuck 
 
 ## Scope
 
-futon embeds text locally and nothing else. There is one `Embedder` interface and one engine. Hosted embedding APIs, HTTP embedding servers, daemons and model downloads are out of scope: applications that want those already have clients for them, and keeping them out is what keeps this module small, dependency-light and free of network code.
+futon embeds text locally and nothing else. There is one `Embedder` interface and one engine. Hosted embedding APIs, HTTP embedding servers and daemons are out of scope: applications that want those already have clients for them. The embedder and the `packs` package contain no network code. Downloading weights lives in the separate, optional `hub` package, which only the command-line tool and applications that want a one-call "get this model" import.
 
 ## Vector provenance
 
