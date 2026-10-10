@@ -7,12 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -112,15 +108,6 @@ func installFakePack(t *testing.T, modelsDir, packID string) {
 	}
 }
 
-func checksumsFor(archives map[string][]byte) []byte {
-	var b strings.Builder
-	for name, data := range archives {
-		sum := sha256.Sum256(data)
-		fmt.Fprintf(&b, "%s  %s\n", hex.EncodeToString(sum[:]), name)
-	}
-	return []byte(b.String())
-}
-
 // visibleEntries returns non-hidden names in dir — what a reader of
 // models_dir can actually see. Atomicity assertions run on this.
 func visibleEntries(t *testing.T, dir string) []string {
@@ -141,20 +128,13 @@ func visibleEntries(t *testing.T, dir string) []string {
 	return names
 }
 
-// ── local-first contract ──────────────────────────────────────────────────────
+// ── resolve ──
 
-func TestResolvePresentMakesNoNetworkCalls(t *testing.T) {
+func TestResolveFindsAnInstalledPack(t *testing.T) {
 	modelsDir := t.TempDir()
 	installFakePack(t, modelsDir, "fake-pack-v1")
 
-	// ANY request to this server is a contract violation.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("local-first contract violated: network call to %s while pack is present", r.URL)
-		http.Error(w, "forbidden", http.StatusForbidden)
-	}))
-	defer srv.Close()
-
-	dir, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, "fake-pack-v1")
+	dir, err := Resolve(modelsDir, "fake-pack-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +155,7 @@ func TestResolveRealPackPresent(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(modelsDir, packID, "manifest.json")); err != nil {
 		t.Skipf("real pack %s not installed locally", packID)
 	}
-	dir, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: false}, packID)
+	dir, err := Resolve(modelsDir, packID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,155 +166,6 @@ func TestResolveRealPackPresent(t *testing.T) {
 	}
 	if !info.OK || info.Dir != dir || info.Revision == "" {
 		t.Fatalf("info = %+v", info)
-	}
-}
-
-// ── download path ─────────────────────────────────────────────────────────────
-
-func TestResolveDownloadsVerifiesInstalls(t *testing.T) {
-	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         checksumsFor(archives),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-
-	dir, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Verify(modelsDir, packID); err != nil {
-		t.Fatalf("installed pack fails verification: %v", err)
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 1 || got[0] != packID {
-		t.Fatalf("models dir entries = %v, want just the pack", got)
-	}
-	// Temp files must be cleaned up.
-	entries, _ := os.ReadDir(modelsDir)
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".weights-") {
-			t.Errorf("leftover temp entry %s", e.Name())
-		}
-	}
-	// Second resolve is pure local.
-	srv.Close()
-	dir2, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	if err != nil || dir2 != dir {
-		t.Fatalf("second resolve: %q, %v", dir2, err)
-	}
-}
-
-func TestResolveAutoPullDisabled(t *testing.T) {
-	_, err := ResolveWith(Options{ModelsDir: t.TempDir(), AutoPull: false}, "fake-pack-v1")
-	var notInstalled *NotInstalledError
-	if !errors.As(err, &notInstalled) {
-		t.Fatalf("err = %v, want NotInstalledError", err)
-	}
-}
-
-func TestResolveOffline(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	source := sourceFor(srv)
-	srv.Close() // dead endpoint = offline host
-	modelsDir := t.TempDir()
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: source}, "fake-pack-v1")
-	var unavailable *UnavailableError
-	if !errors.As(err, &unavailable) {
-		t.Fatalf("err = %v, want UnavailableError", err)
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("offline failure left entries: %v", got)
-	}
-}
-
-func TestResolveArchiveShaMismatch(t *testing.T) {
-	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	// Checksums manifest vouches for DIFFERENT bytes.
-	bogus := bytes.Repeat([]byte{0x01}, 32)
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         []byte(hex.EncodeToString(bogus) + "  " + packID + ArchiveSuffix + "\n"),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	var verr *VerificationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("err = %v, want VerificationError", err)
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("failed pull left entries: %v", got)
-	}
-}
-
-func TestResolveTamperedMemberInsideArchive(t *testing.T) {
-	packID := "fake-pack-v1"
-	members := packBytes(t, packID, fakePackFiles())
-	// Tamper AFTER manifest generation: outer archive sha will be honest
-	// about the tampered bytes, so only member verification can catch it.
-	members["model.safetensors"] = bytes.Repeat([]byte{0xEE}, 4096)
-	packArchive := writePackArchive(t, members)
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         checksumsFor(archives),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	var verr *VerificationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("err = %v, want VerificationError", err)
-	}
-	if verr.Member != "model.safetensors" {
-		t.Errorf("Member = %q, want model.safetensors", verr.Member)
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("tampered pull left entries: %v", got)
-	}
-}
-
-func TestResolveChecksumsMissingEntry(t *testing.T) {
-	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  other" + ArchiveSuffix + "\n"),
-	}
-	srv := fakeSource(t, assets)
-	_, err := ResolveWith(Options{ModelsDir: t.TempDir(), AutoPull: true, Source: sourceFor(srv)}, packID)
-	var verr *VerificationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("err = %v, want VerificationError (fail closed on unvouched asset)", err)
-	}
-}
-
-func TestResolveUnsafeArchiveEntry(t *testing.T) {
-	packID := "fake-pack-v1"
-	members := packBytes(t, packID, fakePackFiles())
-	members["../evil"] = []byte("escape")
-	packArchive := writePackArchive(t, members)
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         checksumsFor(archives),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	var verr *VerificationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("err = %v, want VerificationError", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(filepath.Dir(modelsDir), "evil")); statErr == nil {
-		t.Fatal("path traversal escaped models dir")
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("unsafe archive left entries: %v", got)
 	}
 }
 
@@ -541,127 +372,97 @@ func TestInstallCorruptArchive(t *testing.T) {
 	}
 }
 
-func TestResolveTruncatedDownload(t *testing.T) {
-	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	// The server serves only the first half of the archive; the checksums
-	// manifest vouches for the whole thing.
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive[:len(packArchive)/2],
-		ChecksumsAsset:         checksumsFor(archives),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	var verr *VerificationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("err = %v, want VerificationError (truncated body must fail the archive sha)", err)
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("truncated download left entries: %v", got)
-	}
-}
-
-func TestResolveReleaseMissingArchiveAsset(t *testing.T) {
-	// The weights release exists and has a checksums file, but this pack's archive was
-	// never uploaded (partial release).
-	assets := map[string][]byte{
-		ChecksumsAsset: []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  fake-pack-v1" + ArchiveSuffix + "\n"),
-	}
-	srv := fakeSource(t, assets)
-	_, err := ResolveWith(Options{ModelsDir: t.TempDir(), AutoPull: true, Source: sourceFor(srv)}, "fake-pack-v1")
-	var unavailable *UnavailableError
-	if !errors.As(err, &unavailable) {
-		t.Fatalf("err = %v, want UnavailableError", err)
-	}
-	if !strings.Contains(err.Error(), "fake-pack-v1"+ArchiveSuffix) {
-		t.Errorf("error %q does not name the missing asset", err)
-	}
-}
-
-func TestResolveUnwritableModelsDir(t *testing.T) {
-	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
-		t.Skip("directory permission bits are not enforced here")
-	}
-	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         checksumsFor(archives),
-	}
-	srv := fakeSource(t, assets)
-	modelsDir := t.TempDir()
-	if err := os.Chmod(modelsDir, 0o500); err != nil {
+func writeArchive(t *testing.T, packID string, members map[string][]byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), packID+ArchiveSuffix)
+	if err := os.WriteFile(path, writePackArchive(t, members), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(modelsDir, 0o700) })
-	// A full disk and an unwritable directory take the same code path: the
-	// staging write fails before anything is visible.
-	_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
-	if err == nil {
-		t.Fatal("resolve into unwritable models dir succeeded")
-	}
-	if got := visibleEntries(t, modelsDir); len(got) != 0 {
-		t.Fatalf("failed install left entries: %v", got)
+	return path
+}
+
+func TestResolveMissingIsTyped(t *testing.T) {
+	_, err := Resolve(t.TempDir(), "fake-pack-v1")
+	var notInstalled *NotInstalledError
+	if !errors.As(err, &notInstalled) {
+		t.Fatalf("err = %v, want NotInstalledError", err)
 	}
 }
 
-func TestResolveConcurrentSamePack(t *testing.T) {
+func TestInstallTamperedMemberInsideArchive(t *testing.T) {
 	packID := "fake-pack-v1"
-	packArchive := writePackArchive(t, packBytes(t, packID, fakePackFiles()))
-	archives := map[string][]byte{packID + ArchiveSuffix: packArchive}
-	assets := map[string][]byte{
-		packID + ArchiveSuffix: packArchive,
-		ChecksumsAsset:         checksumsFor(archives),
+	members := packBytes(t, packID, fakePackFiles())
+	// Tamper AFTER manifest generation: only member verification can catch it.
+	members["model.safetensors"] = bytes.Repeat([]byte{0xEE}, 4096)
+	modelsDir := t.TempDir()
+	_, err := Install(modelsDir, writeArchive(t, packID, members), false)
+	var verr *VerificationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("err = %v, want VerificationError", err)
 	}
-	srv := fakeSource(t, assets)
+	if verr.Member != "model.safetensors" {
+		t.Errorf("Member = %q, want model.safetensors", verr.Member)
+	}
+	if got := visibleEntries(t, modelsDir); len(got) != 0 {
+		t.Fatalf("tampered install left entries: %v", got)
+	}
+}
+
+func TestInstallUnsafeArchiveEntry(t *testing.T) {
+	packID := "fake-pack-v1"
+	members := packBytes(t, packID, fakePackFiles())
+	members["../evil"] = []byte("escape")
+	modelsDir := t.TempDir()
+	_, err := Install(modelsDir, writeArchive(t, packID, members), false)
+	if err == nil {
+		t.Fatal("Install accepted an archive with a path-traversal entry")
+	}
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(modelsDir), "evil")); statErr == nil {
+		t.Fatal("path traversal escaped models dir")
+	}
+	if got := visibleEntries(t, modelsDir); len(got) != 0 {
+		t.Fatalf("unsafe archive left entries: %v", got)
+	}
+}
+
+func TestInstallConcurrentSamePack(t *testing.T) {
+	packID := "fake-pack-v1"
+	archive := writeArchive(t, packID, packBytes(t, packID, fakePackFiles()))
 	modelsDir := t.TempDir()
 
 	const n = 8
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			_, err := ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true, Source: sourceFor(srv)}, packID)
+			_, err := Install(modelsDir, archive, false)
 			errs <- err
 		}()
 	}
+	installed := 0
 	for i := 0; i < n; i++ {
-		if err := <-errs; err != nil {
-			t.Errorf("concurrent resolve %d: %v", i, err)
+		err := <-errs
+		var already *AlreadyInstalledError
+		switch {
+		case err == nil:
+			installed++
+		case errors.As(err, &already):
+		default:
+			t.Errorf("concurrent install %d: %v", i, err)
 		}
 	}
+	if installed == 0 {
+		t.Fatal("no concurrent install succeeded")
+	}
 	if got := visibleEntries(t, modelsDir); len(got) != 1 || got[0] != packID {
-		t.Fatalf("models dir after %d concurrent resolves = %v", n, got)
+		t.Fatalf("models dir after %d concurrent installs = %v", n, got)
 	}
 	if _, err := Verify(modelsDir, packID); err != nil {
 		t.Fatalf("pack after concurrent installs fails verification: %v", err)
 	}
-	// No stray staging leftovers either.
 	entries, _ := os.ReadDir(modelsDir)
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".weights-") {
 			t.Errorf("leftover staging entry %s", e.Name())
 		}
 	}
-}
-
-// fakeSource serves assets as a static directory: GET /<asset name>.
-func fakeSource(t *testing.T, assets map[string][]byte) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		data, ok := assets[strings.TrimPrefix(r.URL.Path, "/")]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		w.Write(data)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func sourceFor(srv *httptest.Server) *Source {
-	return &Source{BaseURL: srv.URL, HTTPClient: srv.Client()}
 }

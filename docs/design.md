@@ -4,12 +4,9 @@
 
 A sidecar daemon is a hard runtime dependency with its own failure modes (stuck runners, port clashes, a download the user never asked for) and no story for hosts where nothing can be installed. futon embeds with nothing but a verified weight-pack directory on disk: no daemon, no CGO, one static binary.
 
-## Providers
+## Scope
 
-- `native` (default): in-process inference from a weight pack. `ModelPath` points at a pack directory; otherwise `ModelsDir` joined with the pack id mapped from `Model`. The provider itself never downloads.
-- `auto`: native when a usable pack exists, otherwise the null provider, so callers keep their lexical search path. Never probes the network.
-- `openai`, `gemini`, `bedrock`: hosted backends. `openai` with `BaseURL` also covers any OpenAI-compatible local server.
-- `null`: returns `(nil, nil)`; callers fall back to full-text search.
+futon embeds text locally and nothing else. There is one `Embedder` interface and one engine. Hosted embedding APIs, HTTP embedding servers, daemons and model downloads are out of scope: applications that want those already have clients for them, and keeping them out is what keeps this module small, dependency-light and free of network code.
 
 ## Vector provenance
 
@@ -23,7 +20,7 @@ Pack manifests carry the upstream task-prefix templates (for example `search_que
 
 ## Weight packs
 
-A pack is a directory:
+A pack is a directory (see [packs.md](packs.md) for building and sharing them):
 
 ```
 <models dir>/bge-small-en-v1.5/
@@ -34,7 +31,7 @@ A pack is a directory:
   LICENSE
 ```
 
-Built by `scripts/build-weight-pack.py` from revisions pinned by commit SHA (bumping one moves the vector space, so it is a reviewed change). The script is deterministic (byte-identical re-runs) and self-verifying (bit-exact tensor round trip).
+Built by `scripts/build-weight-pack.py` from revisions pinned by commit SHA (bumping one moves the vector space, so it is a reviewed change). The script is deterministic (byte-identical re-runs) and self-verifying (bit-exact tensor round trip). It also builds any plain BERT encoder from `--repo`/`--revision`; see [packs.md](packs.md).
 
 | pack | upstream | size |
 |---|---|---|
@@ -76,5 +73,7 @@ Parity against the pinned reference (cross-checked two independent ways at gener
 | nomic-embed-text-v1.5 | 0.999999 | 1.000000 |
 | nomic-embed-text-v1.5, matryoshka 256 | 0.999999 | n/a |
 | snowflake-arctic-embed-m-long | 0.999998 | 1.000000 |
+
+A model outside the pinned set, all-MiniLM-L6-v2 packed with `--repo`, scores a minimum of 0.999999 over 7 texts against sentence-transformers (including an over-long input clamped to its 256-token limit).
 
 Throughput on a 16-thread Windows machine, mixed-corpus batches: bge-small 210 ms/text on one thread and about 45 ms/text on all cores (about 1,560 tokens/s); nomic 590 ms/text on one thread and 165-250 ms/text on all cores (the all-core figure is noisy on a shared machine). Numbers will vary by CPU.

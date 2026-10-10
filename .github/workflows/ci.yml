@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        go: ["1.23", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: vet
+        run: go vet ./...
+      - name: test (CGO disabled)
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+      - name: test with the portable kernel
+        env:
+          CGO_ENABLED: "0"
+          FUTON_NATIVE_PUREGO: "1"
+        run: go test -count=1 ./native
+      - name: test with the race detector
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+
+  cross-build:
+    name: cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: build every target without CGO
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64; do
+            echo "== $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build ./...
+          done
+      - name: no cgo files anywhere in the dependency tree
+        run: |
+          cgo=$(go list -deps -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '^$' | grep -v -E '^(runtime/cgo|net|os/user|crypto/x509)$' || true)
+          test -z "$cgo" || { echo "cgo found: $cgo"; exit 1; }
+
+  parity:
+    name: parity on real weights (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cache the bge-small pack
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: pack-bge-${{ hashFiles('scripts/build-weight-pack.py') }}
+      - name: build the bge-small pack
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          pip install "huggingface_hub==0.34.4" "safetensors==0.4.5" "numpy>=1.26,<3" "zstandard==0.23.0"
+          python scripts/build-weight-pack.py --models-dir models --model bge
+      - name: verify the pack with the command-line tool
+        run: |
+          go build -o futon ./cmd/futon
+          ./futon packs list -models-dir models
+          ./futon packs verify -models-dir models bge-small-en-v1.5
+      - name: parity against the reference vectors
+        env:
+          FUTON_NATIVE_TEST_MODELS: ${{ github.workspace }}/models
+        run: go test -count=1 -run 'Parity|BatchMatchesSingle' -v ./native

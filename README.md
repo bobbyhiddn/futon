@@ -2,81 +2,107 @@
 
 # futon
 
-Text in, vectors out. futon is the embedding half of a retrieval system and nothing more.
+Text in, vectors out. futon runs embedding models inside your Go program: pure Go, no CGO, no sidecar, no network.
 
-- **No sidecar.** A pure-Go (zero CGO) engine runs BERT-family encoders from local weight packs, in process. AVX2/FMA kernels on amd64, NEON on arm64, a portable fallback everywhere else.
-- **Faithful.** Tokenization matches the HuggingFace reference exactly. On real weights the engine holds >= 0.999999 cosine against the pinned reference on every corpus text, and its output is bit-deterministic at any thread count.
-- **Swappable.** One `Provider` interface. Hosted and OpenAI-compatible HTTP backends (`openai`, `gemini`, `bedrock`) sit behind the same interface, and a `null` provider lets callers fall back to lexical search.
-- **Careful with weights.** Packs are sha256-verified at install and again at load, installed atomically, and never downloaded unless the host application says so.
+It is a library, not a server and not an LLM runtime. It does one job, turning text into vectors with BERT-family encoders, so applications can add vector search, clustering or memory without shipping or managing a separate embedding service.
 
-Supported packs:
-
-| pack | size | dims | parity vs reference (26 texts, min cosine) | speed, 16 threads, amd64 AVX2 |
-|---|---|---|---|---|
-| `bge-small-en-v1.5` | 67 MB | 384 | 1.000000 | ~45 ms/text, ~1,560 tokens/s |
-| `nomic-embed-text-v1.5` | 274 MB | 768 (matryoshka down to 64) | 0.999999 | ~165-250 ms/text, ~300-450 tokens/s |
-| `snowflake-arctic-embed-m-long` | 274 MB | 768 | 0.999998 | similar to nomic |
-
-Speed is one Windows machine, batch of mixed prose/code/unicode texts; yours will differ. Run `go test ./native -bench Native` with packs installed to measure your own.
+- **In process.** Weights load from a local directory into your process. Nothing to install, start or keep alive.
+- **Pure Go.** No CGO anywhere in the dependency tree (CI enforces it), so cross-compiling is `GOOS=... go build`. AVX2/FMA kernels on amd64, NEON on arm64, a portable fallback everywhere else.
+- **Faithful.** The tokenizer matches the Hugging Face reference id for id, and vectors match the reference implementation at cosine >= 0.9999 (typically >= 0.999999) on a corpus of prose, code, accents, CJK, emoji and edge cases. Output is bit-deterministic at any thread count.
+- **Bring your own model.** Any plain BERT encoder works once packed (see [docs/packs.md](docs/packs.md)); three popular models are tested out of the box.
+- **Careful with weights.** Packs are sha256-verified at install and again at load, installed atomically, and never fetched over the network by the library.
 
 ## Use
 
 ```go
-p, err := futon.New(futon.Config{
-    Provider: "native",
-    Model:    "bge-small-en-v1.5",
-    ModelsDir: modelsDir, // one subdirectory per pack id
-})
-if err != nil { /* typed: *packs.NotInstalledError, *packs.VerificationError, ... */ }
-defer p.Close()
+import "github.com/bobbyhiddn/futon"
 
-vec, err := p.Embed(ctx, "the quick brown fox")
-vecs, err := p.EmbedBatch(ctx, texts)
-p.ModelName() // "native/bge-small-en-v1.5": engine-qualified, store it with every vector
+e, err := futon.New(futon.Options{Model: "bge-small-en-v1.5"})
+if err != nil {
+    // *packs.NotInstalledError if the pack is not on disk
+}
+defer e.Close()
+
+vec, err := e.Embed(ctx, "the quick brown fox")
+vecs, err := e.EmbedBatch(ctx, texts)
+
+e.Dimensions() // 384
+e.ModelName()  // "native/bge-small-en-v1.5": store this next to every vector
 ```
 
-`Provider: "auto"` uses the native engine when a pack is present and returns the null provider otherwise.
+`CosineSimilarity`, `Serialize` and `Deserialize` are included for the common ranking and storage steps. futon deliberately has no index or database: use whatever store you already have.
 
-## Weight packs
+A model is a *weight pack*, a directory under `~/.futon/models` (override with `Options.ModelsDir` or `FUTON_HOME`). Build one from Hugging Face with the script in this repo:
 
-Packs are directories (`config.json`, `model.safetensors`, `vocab.txt`, `manifest.json`, `LICENSE`) built by `scripts/build-weight-pack.py` from pinned upstream revisions, and distributed as `.futonw` archives (deterministic tar.zst) next to a `weights-checksums.txt`.
+```
+pip install huggingface_hub safetensors numpy zstandard
+python scripts/build-weight-pack.py --model bge        # bge-small-en-v1.5, 67 MB
+```
 
-- `packs.Install` sideloads an archive with no network.
-- `packs.LoadDir` installs a pack directory.
-- `packs.ResolveWith` fetches from a `packs.Source` (any static host) only when `AutoPull` is explicitly true.
+The pack is yours: futon does not host or distribute weights. See [docs/packs.md](docs/packs.md) for the other built-in models, for packing any BERT-style model, and for sharing packs between machines.
+
+## Models
+
+| pack | size | dims | vs reference (min cosine, 26 texts) |
+|---|---|---|---|
+| `bge-small-en-v1.5` | 67 MB | 384 | 1.000000 |
+| `nomic-embed-text-v1.5` | 274 MB | 768 (matryoshka to 64) | 0.999999 |
+| `snowflake-arctic-embed-m-long` | 274 MB | 768 | 0.999998 |
+| `all-MiniLM-L6-v2` (built with `--repo`) | 45 MB | 384 | 0.999999 (7 texts) |
+
+Supported: plain BERT encoders (WordPiece vocab, absolute positions, GELU) with CLS or mean pooling, and the nomic-bert variant (RoPE, SwiGLU). Not supported: GPU, training, decoder/LLM models, SentencePiece or BPE tokenizers (so no multilingual-e5 or other XLM-R models), and anything that is not an encoder.
+
+Speed depends on your CPU. On a 16-thread Windows machine bge-small embeds a mixed-content text in about 45-50 ms using all cores; run `go test ./native -bench Native` with a pack installed to measure your own hardware.
+
+## Command line
+
+```
+go install github.com/bobbyhiddn/futon/cmd/futon@latest
+
+futon embed -model bge-small-en-v1.5 "some text" "more text"   # one JSON vector per line
+futon packs list
+futon packs verify bge-small-en-v1.5
+futon packs install my-model.futonw      # from an archive made by the build script
+futon packs load ./models/my-model       # from a pack directory
+```
 
 ## Vector spaces
 
-Vectors from different engines are different spaces, even for the same checkpoint: llama.cpp-based servers tokenize BERT text non-conformantly. Never compare or mix vectors under one model name. `ModelName()` is engine-qualified for this reason, so a store can detect mismatches and re-embed.
+Vectors from different engines are different spaces, even for the same checkpoint: llama.cpp-based servers tokenize BERT text non-conformantly and drift from the reference. Never compare or mix vectors under one model name. `ModelName()` is engine-qualified for this reason, so a store can detect a mismatch and re-embed. Changing a pack's pinned revision also moves the space.
+
+## Related projects
+
+futon is not the first Go library to run embedding models locally. Pick the one that matches your constraints:
+
+- [goformer](https://github.com/MichaelAyles/goformer): pure-Go BERT inference that loads a Hugging Face model directory as is, with no conversion step, so it is quicker to try. See [docs/comparison.md](docs/comparison.md) for how it differs (kernels, pooling, architectures, packs).
+- [hugot](https://github.com/knights-analytics/hugot): Hugging Face pipelines for Go, ONNX models, with a pure-Go backend (GoMLX) or ONNX Runtime/XLA backends that need native libraries. Broader than futon: more pipelines and architectures.
+- [cybertron](https://github.com/nlpodyssey/cybertron): pure-Go transformers on the spaGO framework, with its own converted model format.
+- [kelindar/search](https://github.com/kelindar/search): GGUF models through llama.cpp shared libraries, plus a vector index.
+- [fastembed-go](https://github.com/Anush008/fastembed-go): ONNX Runtime bindings.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `/` | `Provider`, `Config`, factory, HTTP backends, vector helpers |
-| `native/` | the in-process engine: tokenizer, safetensors, kernels |
-| `packs/` | pack install, verify, fetch |
-| `scripts/` | pack builder and parity-fixture generator |
-| `docs/design-native.md` | design notes and measurements |
+| `/` | `Embedder`, `Options`, `New`, vector helpers |
+| `native/` | the engine: tokenizer, safetensors, kernels, model |
+| `packs/` | pack install, verify, list |
+| `cmd/futon` | command-line tool |
+| `scripts/` | pack builder, pack checker, fixture generator |
+| `docs/` | [pack guide](docs/packs.md), [design notes](docs/design.md), [comparison](docs/comparison.md) |
 
 ## Testing
 
-`go test ./...` runs toy-model architecture, tokenizer, kernel and pack tests with no downloads. Real-weights parity and benchmarks skip until packs exist:
+`go test ./...` runs toy-model architecture, tokenizer, kernel and pack tests with no downloads. CI runs it on Linux (amd64, arm64), macOS (arm64) and Windows with Go 1.23 and stable, with `CGO_ENABLED=0`, with the portable kernel, and under the race detector, plus real-weights parity against bge-small on Linux and macOS (which exercises the AVX2 and NEON kernels on real hardware).
+
+To run parity on every model locally:
 
 ```
-python scripts/build-weight-pack.py --models-dir ./models --model bge
+python scripts/build-weight-pack.py --models-dir ./models
 FUTON_NATIVE_TEST_MODELS=./models go test ./native -run Parity -v
 ```
 
-With all three packs built, the suite checks every model against the reference on all 26 corpus texts, plus matryoshka truncation, the trained-context clamp and batch-equals-single bit equality.
-
-## Docs
-
-- [`docs/design.md`](docs/design.md): why in-process, vector provenance, pack format, kernels, verification.
-
-## Requirements
-
-Go 1.23 or newer. No CGO. Building packs needs Python 3.10+ (`scripts/build-weight-pack.py` lists its pinned dependencies); regenerating the test fixtures additionally needs torch (see `scripts/gen-native-embed-fixtures.py`).
+Requires Go 1.23 or newer.
 
 ## License
 

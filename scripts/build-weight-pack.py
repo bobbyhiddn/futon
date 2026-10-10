@@ -24,7 +24,15 @@ For each model it:
      vocab.txt, LICENSE, and manifest.json with per-member sha256.
 
 Usage:
-    scripts/build-weight-pack.py [--models-dir ~/.futon/models] [--model all|nomic|bge]
+    scripts/build-weight-pack.py [--models-dir ~/.futon/models] [--model all|nomic|bge|arctic]
+
+Bring your own model (plain BERT encoders: absolute positions, GELU, WordPiece
+vocab.txt, e.g. bge-base/large, all-MiniLM-L6/L12, e5-*, gte-*, mxbai-embed):
+    scripts/build-weight-pack.py --repo BAAI/bge-base-en-v1.5 \\
+        --revision <40-char commit sha> --pooling cls [--pack-id my-name]
+The pack id defaults to the repo name. Pooling is a property of how the model
+was trained (see its model card): "cls" or "mean". Pass --no-normalize for
+models that do not L2-normalize their output.
     scripts/build-weight-pack.py --archive [--archive-dir dist/weights]
     scripts/build-weight-pack.py --archive-existing [--archive-dir dist/weights]
 
@@ -73,7 +81,7 @@ PACK_FORMAT = 1
 EXPECTED_LICENSE = {NOMIC_REPO: "apache-2.0", BGE_REPO: "mit", ARCTIC_REPO: "apache-2.0"}
 
 # LOW-4: both launch models ship the identical bert-base-uncased vocab.txt,
-# and internal/embed/native/testdata/vocab_bert_uncased.txt is committed as
+# and native/testdata/vocab_bert_uncased.txt is committed as
 # that exact file so tokenizer conformance runs in CI. This recorded hash is
 # mirrored by expectedVocabSHA256 in tokenizer_test.go — if an upstream pin
 # bump ever changes the vocab, BOTH must change in one reviewed commit
@@ -180,6 +188,52 @@ BGE_CONFIG = {
         "pad_token": "[PAD]",
     },
 }
+
+
+def custom_bert_config(hf_cfg: dict, tok_cfg: dict, pack_id: str, pooling: str, normalize: bool) -> dict:
+    """Pack config for a plain BERT encoder, from its Hugging Face config.json."""
+    if hf_cfg.get("model_type") != "bert":
+        raise SystemExit(
+            f"model_type is {hf_cfg.get('model_type')!r}; only plain BERT encoders are supported "
+            "by the custom path (roberta/xlm-roberta/deberta/etc. use different tokenizers)"
+        )
+    if hf_cfg.get("hidden_act", "gelu") != "gelu":
+        raise SystemExit(f"hidden_act {hf_cfg['hidden_act']!r} is not supported (only exact GELU)")
+    if hf_cfg.get("position_embedding_type", "absolute") != "absolute":
+        raise SystemExit("only absolute position embeddings are supported")
+    if hf_cfg["hidden_size"] % hf_cfg["num_attention_heads"] != 0:
+        raise SystemExit("hidden_size is not divisible by num_attention_heads")
+    return {
+        "pack_format": PACK_FORMAT,
+        "model_id": pack_id,
+        "hidden_size": hf_cfg["hidden_size"],
+        "num_layers": hf_cfg["num_hidden_layers"],
+        "num_heads": hf_cfg["num_attention_heads"],
+        "intermediate_size": hf_cfg["intermediate_size"],
+        "vocab_size": hf_cfg["vocab_size"],
+        "type_vocab_size": hf_cfg.get("type_vocab_size", 2),
+        "max_seq_len": hf_cfg["max_position_embeddings"],
+        "layer_norm_eps": hf_cfg.get("layer_norm_eps", 1e-12),
+        "position_encoding": "absolute",
+        "activation": "gelu",
+        "pooling": pooling,
+        "normalize": normalize,
+        "tokenizer": {
+            "do_lower_case": tok_cfg.get("do_lower_case", True),
+            "tokenize_chinese_chars": tok_cfg.get("tokenize_chinese_chars", True),
+            "cls_token": tok_cfg.get("cls_token", "[CLS]"),
+            "sep_token": tok_cfg.get("sep_token", "[SEP]"),
+            "unk_token": tok_cfg.get("unk_token", "[UNK]"),
+            "pad_token": tok_cfg.get("pad_token", "[PAD]"),
+        },
+    }
+
+
+def strip_prefix(src: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Some BERT checkpoints prefix every tensor with 'bert.'; the pack scheme does not."""
+    if src and all(k.startswith("bert.") for k in src if not k.startswith("cls.")):
+        return {(k[len("bert."):] if k.startswith("bert.") else k): v for k, v in src.items()}
+    return src
 
 
 def sha256_file(path: Path) -> str:
@@ -314,7 +368,7 @@ def declared_license(readme: Path) -> str:
     return m.group(1)
 
 
-SPDX_IDS = {"mit": "MIT", "apache-2.0": "Apache-2.0"}
+SPDX_IDS = {"mit": "MIT", "apache-2.0": "Apache-2.0", "bsd-3-clause": "BSD-3-Clause", "cc-by-4.0": "CC-BY-4.0"}
 
 
 def write_license(dst: Path, repo: str, revision: str, license_id: str) -> None:
@@ -324,7 +378,7 @@ def write_license(dst: Path, repo: str, revision: str, license_id: str) -> None:
         f"Revision: {revision}\n\n"
         f"The upstream repository declares its license in the model card front\n"
         f"matter and ships no standalone LICENSE file. Canonical license text:\n"
-        f"https://spdx.org/licenses/{SPDX_IDS[license_id]}.html\n",
+        f"https://spdx.org/licenses/{SPDX_IDS.get(license_id, license_id)}.html\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -368,7 +422,8 @@ def source_word_embedding(source: dict[str, np.ndarray]) -> np.ndarray:
     return source["embeddings.word_embeddings.weight"]
 
 
-def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path) -> None:
+def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path, custom_license: str | None = None) -> None:
+    custom = repo not in EXPECTED_LICENSE
     pack_dir = models_dir / cfg["model_id"]
     pack_dir.mkdir(parents=True, exist_ok=True)
     print(f"== {cfg['model_id']}  ({repo} @ {revision[:12]})")
@@ -377,21 +432,23 @@ def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path) -> None:
     vocab_path = Path(hf_hub_download(repo, "vocab.txt", revision=revision))
     readme_path = Path(hf_hub_download(repo, "README.md", revision=revision))
 
-    license_id = declared_license(readme_path)
-    if license_id != EXPECTED_LICENSE[repo]:
+    license_id = custom_license or declared_license(readme_path)
+    if not custom and license_id != EXPECTED_LICENSE[repo]:
         raise SystemExit(f"{repo}: model card declares license {license_id!r}, expected {EXPECTED_LICENSE[repo]!r}")
 
     vocab_sha = sha256_file(vocab_path)
-    if vocab_sha != EXPECTED_VOCAB_SHA256:
+    if not custom and vocab_sha != EXPECTED_VOCAB_SHA256:
         raise SystemExit(
             f"{repo}: vocab.txt sha256 {vocab_sha} != recorded {EXPECTED_VOCAB_SHA256}.\n"
-            "The committed test vocab (internal/embed/native/testdata/vocab_bert_uncased.txt)\n"
+            "The committed test vocab (native/testdata/vocab_bert_uncased.txt)\n"
             "and tokenizer conformance fixtures would no longer describe this pack. Update the\n"
             "recorded hash here AND expectedVocabSHA256 in tokenizer_test.go AND the committed\n"
             "vocab + fixtures in one reviewed change."
         )
 
     source = load_source_tensors(st_path)
+    if custom:
+        source = strip_prefix(source)
     if cfg["model_id"] in ("nomic-embed-text-v1.5", "snowflake-arctic-embed-m-long"):
         canonical = canonicalize_nomic(source, cfg)
     else:
@@ -416,7 +473,7 @@ def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path) -> None:
         # DECLARES (max_seq_len) and what the model was TRAINED on. The Go
         # loader clamps to the trained value — plain RoPE extrapolation past
         # it is a measured silent-degradation regime (see
-        # docs/design/native-embeddings.md).
+        # docs/design.md).
         "declared_max_seq_len": cfg["max_seq_len"],
         "trained_seq_len": cfg.get("max_trained_positions", cfg["max_seq_len"]),
         # The exact tensor-name set (optionals included). The loader verifies
@@ -444,7 +501,7 @@ def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path) -> None:
 # ── weight-pack distribution archives ─────────────────────────────────────────
 # Format: tar.zst of the pack directory members, FLAT (no directory prefix):
 # config.json, model.safetensors, vocab.txt, manifest.json, LICENSE.
-# Consumed by internal/modelpack (Resolve/Install), which re-verifies every
+# Consumed by package packs (Install), which re-verifies every
 # member against manifest.json before an atomic install.
 #
 # Determinism contract (release assets are append-only; a re-run must
@@ -452,8 +509,7 @@ def build_pack(repo: str, revision: str, cfg: dict, models_dir: Path) -> None:
 #   - entries sorted by name
 #   - mtime=0, uid=gid=0, empty uname/gname, mode 0644, USTAR format
 #   - single zstd frame, level 19, single thread, no content-size surprises
-# The archive extension. internal/modelpack.ArchiveSuffix is the source of
-# truth (TestArchiveSuffixIsSpelledOnce keeps this copy in step with it).
+# The archive extension. packs.ArchiveSuffix is the source of truth.
 ARCHIVE_SUFFIX = ".futonw"
 ARCHIVE_MEMBERS = ("config.json", "model.safetensors", "vocab.txt", "manifest.json", "LICENSE")
 ZSTD_LEVEL = 19
@@ -520,7 +576,13 @@ def archive_pack(models_dir: Path, archive_dir: Path, model_id: str) -> tuple[st
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--models-dir", default=str(Path.home() / ".futon" / "models"))
-    ap.add_argument("--model", choices=["all", "nomic", "bge", "arctic"], default="all")
+    ap.add_argument("--model", choices=["all", "nomic", "bge", "arctic", "none"], default="all")
+    ap.add_argument("--repo", help="Hugging Face repo of a plain BERT encoder to pack (bring your own model)")
+    ap.add_argument("--revision", help="40-char commit sha of --repo (never a branch name: the pin defines the vector space)")
+    ap.add_argument("--pack-id", help="pack id / directory name (default: the repo name, lowercased)")
+    ap.add_argument("--pooling", choices=["cls", "mean"], help="how the model pools token vectors (see its model card)")
+    ap.add_argument("--no-normalize", action="store_true", help="the model does not L2-normalize its output")
+    ap.add_argument("--license", help="license id to record (default: read from the model card)")
     ap.add_argument("--archive", action="store_true",
                     help=f"after building, write <pack-id>{ARCHIVE_SUFFIX} distribution archives + weights-checksums.txt")
     ap.add_argument("--archive-existing", action="store_true",
@@ -532,6 +594,34 @@ def main() -> None:
     archive_dir = Path(args.archive_dir).expanduser()
 
     selected = []
+    custom_license = None
+    if args.repo:
+        if not (args.revision and re.fullmatch(r"[0-9a-f]{40}", args.revision)):
+            raise SystemExit("--revision must be the full 40-character commit sha")
+        if not args.pooling:
+            raise SystemExit("--pooling is required with --repo (cls or mean; see the model card)")
+        if args.repo in EXPECTED_LICENSE:
+            raise SystemExit(f"{args.repo} is a built-in model: use --model instead")
+        pack_id = args.pack_id or args.repo.split("/")[-1].lower()
+        hf_cfg = json.loads(Path(hf_hub_download(args.repo, "config.json", revision=args.revision)).read_text(encoding="utf-8"))
+        try:
+            tok_cfg = json.loads(Path(hf_hub_download(args.repo, "tokenizer_config.json", revision=args.revision)).read_text(encoding="utf-8"))
+        except Exception:
+            tok_cfg = {}
+        cfg = custom_bert_config(hf_cfg, tok_cfg, pack_id, args.pooling, not args.no_normalize)
+        # sentence-transformers models are trained and served with a shorter limit than
+        # BERT's declared position count; honour it, or long inputs diverge from the reference.
+        try:
+            st_cfg = json.loads(Path(hf_hub_download(args.repo, "sentence_bert_config.json", revision=args.revision)).read_text(encoding="utf-8"))
+            limit = int(st_cfg.get("max_seq_length") or 0)
+            if 0 < limit < cfg["max_seq_len"]:
+                cfg["max_trained_positions"] = limit
+                print(f"  note: sentence_bert_config.json sets max_seq_length={limit}; pack clamps inputs to it")
+        except Exception:
+            pass
+        selected.append((args.repo, args.revision, cfg))
+        custom_license = args.license
+        args.model = "none"
     if args.model in ("all", "nomic"):
         selected.append((NOMIC_REPO, NOMIC_REVISION, NOMIC_CONFIG))
     if args.model in ("all", "bge"):
@@ -541,7 +631,7 @@ def main() -> None:
 
     if not args.archive_existing:
         for repo, revision, cfg in selected:
-            build_pack(repo, revision, cfg, models_dir)
+            build_pack(repo, revision, cfg, models_dir, custom_license)
 
     if args.archive or args.archive_existing:
         checksums: dict[str, str] = {}

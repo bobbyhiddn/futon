@@ -1,30 +1,22 @@
-// Package packs acquires and verifies native embedding weight packs.
+// Package packs installs, verifies and lists native embedding weight packs.
 //
 // A weight pack is a directory (config.json, model.safetensors, vocab.txt,
-// manifest.json, LICENSE) built by scripts/build-weight-pack.py from pinned
-// upstream revisions. Packs travel as weight-pack archives (ArchiveSuffix: a
-// deterministic tar.zst of the pack directory), published next to a
-// ChecksumsAsset file (sha256 per archive) on any static host (see Source).
+// manifest.json, LICENSE) built by scripts/build-weight-pack.py from a
+// Hugging Face model. Packs move between machines as weight-pack archives
+// (ArchiveSuffix: a deterministic tar.zst of the pack directory).
 //
-// There are two routes to an installed pack, both landing in the same
-// verified state:
+// There are two ways to put a pack on disk, both landing in the same verified
+// state:
 //
-//  1. Resolve: local-first; downloads from a Source only when the pack is
-//     absent and the caller explicitly allowed it.
-//  2. Install: fully offline sideload of a weight-pack archive (USB stick,
-//     internal mirror). No network, ever.
+//  1. Install: unpack a weight-pack archive.
+//  2. LoadDir: copy and verify a pack directory (what the build script
+//     produces).
 //
-// LOCAL-FIRST IS A CONTRACT, NOT A DEFAULT: when the pack directory is
-// already present, Resolve performs zero network activity (pinned by
-// TestResolvePresentMakesNoNetworkCalls). Packs live outside the
-// application's lifecycle, so a download is a rare, usually once-per-host
-// event.
-//
-// Every failure is loud and typed; nothing partial is ever visible in
-// models_dir (extraction happens in a hidden temp dir, then one atomic
-// rename). The native provider re-verifies the full manifest at load
-// (package native), so verification here is defense in depth, not the only
-// gate.
+// This package never touches the network. Every failure is loud and typed,
+// and nothing partial is ever visible in models_dir: extraction happens in a
+// hidden temp dir, then one atomic rename. The native engine re-verifies the
+// full manifest at load (package native), so verification here is defense in
+// depth, not the only gate.
 package packs
 
 import (
@@ -40,9 +32,6 @@ import (
 )
 
 const (
-	// ChecksumsAsset is the sha256 manifest asset on the weights release.
-	ChecksumsAsset = "weights-checksums.txt"
-
 	// ArchiveSuffix is the weight-pack archive extension: a deterministic
 	// tar.zst of the pack directory members (flat, no directory prefix).
 	// It is the only place the extension is set; Install refuses any other.
@@ -50,8 +39,6 @@ const (
 	// spell it too; TestArchiveSuffixIsSpelledOnce keeps them in step.
 	ArchiveSuffix = ".futonw"
 
-	maxChecksumsBytes = int64(1 << 20) // 1 MiB
-	maxArchiveBytes   = int64(2 << 30) // 2 GiB compressed
 	maxExtractBytes   = int64(4 << 30) // 4 GiB total extracted
 	maxArchiveEntries = 64
 )
@@ -60,20 +47,8 @@ const (
 type NotInstalledError struct{ PackID string }
 
 func (e *NotInstalledError) Error() string {
-	return fmt.Sprintf("packs: pack %q is not installed: install a weight-pack archive (%s) with packs.Install, load a pack directory with packs.LoadDir, or allow a download from a Source", e.PackID, ArchiveSuffix)
+	return fmt.Sprintf("packs: pack %q is not installed: install a weight-pack archive (%s) with packs.Install, or load a pack directory with packs.LoadDir", e.PackID, ArchiveSuffix)
 }
-
-// UnavailableError: the pack source (or a required asset on it) could
-// not be reached or does not exist. Offline hosts land here.
-type UnavailableError struct {
-	PackID string
-	Err    error
-}
-
-func (e *UnavailableError) Error() string {
-	return fmt.Sprintf("packs: pack %q could not be fetched: %v", e.PackID, e.Err)
-}
-func (e *UnavailableError) Unwrap() error { return e.Err }
 
 // VerificationError: bytes were obtained but failed integrity verification.
 // Fail closed — nothing verified is nothing installed.
@@ -103,42 +78,19 @@ func (e *AlreadyInstalledError) Error() string {
 	return fmt.Sprintf("packs: pack %q is already installed with a DIFFERENT manifest (installed manifest sha256 %.12s…, archive %.12s…) — re-run with --force to replace it", e.PackID, e.InstalledSHA, e.ArchiveSHA)
 }
 
-// Options configures acquisition.
-type Options struct {
-	// ModelsDir is the pack root (one subdirectory per pack id).
-	ModelsDir string
-	// AutoPull permits a network fetch when the pack is absent.
-	AutoPull bool
-	// Source is where a missing pack is fetched from. Nil means never fetch.
-	Source *Source
-}
-
-// Resolve returns the installed pack directory for packID, downloading and
-// verifying it from the weights release first when absent. Present packs are
-// returned with ZERO network activity (manifest presence is checked here;
-// the native loader performs the full member-hash verification at load).
+// Resolve returns the installed pack directory for packID, or
+// *NotInstalledError when it is absent. Manifest presence is checked here; the
+// native loader performs the full member-hash verification at load.
 func Resolve(modelsDir, packID string) (string, error) {
-	return ResolveWith(Options{ModelsDir: modelsDir, AutoPull: true}, packID)
-}
-
-// ResolveWith is Resolve with explicit Options.
-func ResolveWith(opts Options, packID string) (string, error) {
 	if err := validatePackID(packID); err != nil {
 		return "", err
 	}
-	if opts.ModelsDir == "" {
+	if modelsDir == "" {
 		return "", fmt.Errorf("packs: models dir is required")
 	}
-	dir := filepath.Join(opts.ModelsDir, packID)
-	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
-		// Present: local-first contract — no network from here on.
-		return dir, nil
-	}
-	if !opts.AutoPull || opts.Source == nil {
+	dir := filepath.Join(modelsDir, packID)
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
 		return "", &NotInstalledError{PackID: packID}
-	}
-	if err := pull(opts, packID, dir); err != nil {
-		return "", err
 	}
 	return dir, nil
 }
@@ -177,30 +129,6 @@ func commit(modelsDir, tmpDir, dir, packID string) error {
 		return fmt.Errorf("packs: sync models dir: %w", err)
 	}
 	return nil
-}
-
-// checksumFor finds the sha256 for name in sha256sum-format data.
-func checksumFor(data []byte, name string) (string, error) {
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) < 2 {
-			continue
-		}
-		candidate := filepath.Base(strings.TrimPrefix(fields[1], "*"))
-		if candidate == name {
-			sha := strings.ToLower(fields[0])
-			if len(sha) != 64 || !isHex(sha) {
-				return "", fmt.Errorf("%s entry for %q is not a sha256", ChecksumsAsset, name)
-			}
-			return sha, nil
-		}
-	}
-	return "", fmt.Errorf("%s has no entry for %q", ChecksumsAsset, name)
-}
-
-func isHex(s string) bool {
-	_, err := hex.DecodeString(s)
-	return err == nil
 }
 
 // packManifest is the subset of manifest.json this package consumes. It is

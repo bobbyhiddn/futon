@@ -7,7 +7,6 @@ import (
 
 // Serialize packs a float32 slice into a little-endian binary BLOB.
 // Format: little-endian float32[N] — identical to Python's struct.pack("<Nf", ...).
-// Compatible with manifest.SerializeEmbedding — same byte layout.
 func Serialize(v []float32) []byte {
 	buf := make([]byte, len(v)*4)
 	for i, f := range v {
