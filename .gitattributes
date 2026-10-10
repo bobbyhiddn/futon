@@ -1,0 +1,3 @@
+# Fixture bytes are hashed by pack manifests: never rewrite line endings.
+native/testdata/** -text
+* text=auto eol=lf

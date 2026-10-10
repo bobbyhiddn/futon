@@ -1,0 +1,32 @@
+{
+  "activation": "swiglu",
+  "hidden_size": 32,
+  "intermediate_size": 256,
+  "layer_norm_eps": 1e-12,
+  "matryoshka": {
+    "dims": [
+      32,
+      16
+    ],
+    "layernorm": true
+  },
+  "max_seq_len": 64,
+  "model_id": "toy-rope-swiglu",
+  "normalize": true,
+  "num_heads": 4,
+  "num_layers": 2,
+  "pack_format": 1,
+  "pooling": "mean",
+  "position_encoding": "rope",
+  "rope_theta": 1000.0,
+  "tokenizer": {
+    "cls_token": "[CLS]",
+    "do_lower_case": true,
+    "pad_token": "[PAD]",
+    "sep_token": "[SEP]",
+    "tokenize_chinese_chars": true,
+    "unk_token": "[UNK]"
+  },
+  "type_vocab_size": 2,
+  "vocab_size": 64
+}

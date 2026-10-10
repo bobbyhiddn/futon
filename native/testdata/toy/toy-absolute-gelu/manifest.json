@@ -1,0 +1,50 @@
+{
+  "created_by": "scripts/gen-native-embed-fixtures.py",
+  "members": {
+    "config.json": {
+      "sha256": "05e38917339c948f85e86a16a5ba9a5e9ef051b0575a3828256b897ee45608fe",
+      "size": 523
+    },
+    "model.safetensors": {
+      "sha256": "c1ea0bc59d8cfc86abb56db01fb28ea0761ce778c72f38d36086d8f1d9224251",
+      "size": 87664
+    },
+    "vocab.txt": {
+      "sha256": "70df8e20613afd92fd239baff8403983807911dd26f117943bae7883b0723e81",
+      "size": 190
+    }
+  },
+  "model_id": "toy-absolute-gelu",
+  "pack_format": 1,
+  "tensor_names": [
+    "embeddings.norm.bias",
+    "embeddings.norm.weight",
+    "embeddings.position",
+    "embeddings.token_type",
+    "embeddings.word",
+    "layers.0.attn.out.bias",
+    "layers.0.attn.out.weight",
+    "layers.0.attn.qkv.bias",
+    "layers.0.attn.qkv.weight",
+    "layers.0.mlp.fc1.bias",
+    "layers.0.mlp.fc1.weight",
+    "layers.0.mlp.fc2.bias",
+    "layers.0.mlp.fc2.weight",
+    "layers.0.norm1.bias",
+    "layers.0.norm1.weight",
+    "layers.0.norm2.bias",
+    "layers.0.norm2.weight",
+    "layers.1.attn.out.bias",
+    "layers.1.attn.out.weight",
+    "layers.1.attn.qkv.bias",
+    "layers.1.attn.qkv.weight",
+    "layers.1.mlp.fc1.bias",
+    "layers.1.mlp.fc1.weight",
+    "layers.1.mlp.fc2.bias",
+    "layers.1.mlp.fc2.weight",
+    "layers.1.norm1.bias",
+    "layers.1.norm1.weight",
+    "layers.1.norm2.bias",
+    "layers.1.norm2.weight"
+  ]
+}

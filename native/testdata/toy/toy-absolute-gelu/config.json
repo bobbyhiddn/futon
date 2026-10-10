@@ -1,0 +1,24 @@
+{
+  "activation": "gelu",
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "layer_norm_eps": 1e-12,
+  "max_seq_len": 64,
+  "model_id": "toy-absolute-gelu",
+  "normalize": true,
+  "num_heads": 4,
+  "num_layers": 2,
+  "pack_format": 1,
+  "pooling": "cls",
+  "position_encoding": "absolute",
+  "tokenizer": {
+    "cls_token": "[CLS]",
+    "do_lower_case": true,
+    "pad_token": "[PAD]",
+    "sep_token": "[SEP]",
+    "tokenize_chinese_chars": true,
+    "unk_token": "[UNK]"
+  },
+  "type_vocab_size": 2,
+  "vocab_size": 64
+}

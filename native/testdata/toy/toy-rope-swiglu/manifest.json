@@ -1,0 +1,43 @@
+{
+  "created_by": "scripts/gen-native-embed-fixtures.py",
+  "members": {
+    "config.json": {
+      "sha256": "8162e64fec7a4f26f395496779e0197b0dfee6c49834860aaf5e33f98e616e1b",
+      "size": 630
+    },
+    "model.safetensors": {
+      "sha256": "2503bbfc65364c7803275125b9c6373d1b205ae8f071072bf31ad5375151c811",
+      "size": 240984
+    },
+    "vocab.txt": {
+      "sha256": "70df8e20613afd92fd239baff8403983807911dd26f117943bae7883b0723e81",
+      "size": 190
+    }
+  },
+  "model_id": "toy-rope-swiglu",
+  "pack_format": 1,
+  "tensor_names": [
+    "embeddings.norm.bias",
+    "embeddings.norm.weight",
+    "embeddings.token_type",
+    "embeddings.word",
+    "layers.0.attn.out.weight",
+    "layers.0.attn.qkv.weight",
+    "layers.0.mlp.fc1.weight",
+    "layers.0.mlp.fc2.weight",
+    "layers.0.mlp.gate.weight",
+    "layers.0.norm1.bias",
+    "layers.0.norm1.weight",
+    "layers.0.norm2.bias",
+    "layers.0.norm2.weight",
+    "layers.1.attn.out.weight",
+    "layers.1.attn.qkv.weight",
+    "layers.1.mlp.fc1.weight",
+    "layers.1.mlp.fc2.weight",
+    "layers.1.mlp.gate.weight",
+    "layers.1.norm1.bias",
+    "layers.1.norm1.weight",
+    "layers.1.norm2.bias",
+    "layers.1.norm2.weight"
+  ]
+}
