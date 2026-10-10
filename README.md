@@ -12,6 +12,20 @@ It is a library, not a server and not an LLM runtime. It does one job, turning t
 - **Bring your own model.** Any plain BERT encoder works once packed (see [docs/packs.md](docs/packs.md)); three popular models are tested out of the box.
 - **Careful with weights.** Packs are sha256-verified at install and again at load, installed atomically, and never fetched over the network by the library.
 
+## Try it in a minute
+
+You need Go 1.23+ and Python 3.10+ (Python is only used once, to turn a Hugging Face model into a pack).
+
+```
+git clone https://github.com/bobbyhiddn/futon && cd futon
+pip install huggingface_hub safetensors numpy zstandard
+python scripts/build-weight-pack.py --model bge     # downloads ~130 MB, writes a 67 MB pack to ~/.futon/models
+go run ./cmd/futon embed "hello world"              # prints a 384-number vector
+go run ./cmd/futon packs list
+```
+
+Then in your own program: `go get github.com/bobbyhiddn/futon` and see below.
+
 ## Use
 
 ```go
@@ -32,12 +46,7 @@ e.ModelName()  // "native/bge-small-en-v1.5": store this next to every vector
 
 `CosineSimilarity`, `Serialize` and `Deserialize` are included for the common ranking and storage steps. futon deliberately has no index or database: use whatever store you already have.
 
-A model is a *weight pack*, a directory under `~/.futon/models` (override with `Options.ModelsDir` or `FUTON_HOME`). Build one from Hugging Face with the script in this repo:
-
-```
-pip install huggingface_hub safetensors numpy zstandard
-python scripts/build-weight-pack.py --model bge        # bge-small-en-v1.5, 67 MB
-```
+A model is a *weight pack*, a directory under `~/.futon/models` (override with `Options.ModelsDir` or `FUTON_HOME`). Build one from Hugging Face with `scripts/build-weight-pack.py` (see above).
 
 The pack is yours: futon does not host or distribute weights. See [docs/packs.md](docs/packs.md) for the other built-in models, for packing any BERT-style model, and for sharing packs between machines.
 
