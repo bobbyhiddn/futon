@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Pack IDs of the known configurations. A pack directory is expected at
@@ -156,8 +158,8 @@ func (p *Provider) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 	}
 	maxSeq := p.model.Config().EffectiveMaxSeqLen()
 
-	workers, perForward := batchPlan(len(texts), p.batchWorkers, p.threads)
-	kern := newKernel(perForward)
+	workers, _ := batchPlan(len(texts), p.batchWorkers, p.threads)
+	kern := newElasticKernel(p.threads, workers, len(texts))
 
 	result := make([][]float32, len(texts))
 	errs := make([]error, len(texts))
@@ -174,10 +176,19 @@ func (p *Provider) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 				}
 				ids := p.tok.Encode(texts[i], maxSeq)
 				result[i], errs[i] = p.model.EncodeTokensKernel(ctx, ids, p.dims, kern)
+				kern.remaining.Add(-1)
 			}
 		}()
 	}
-	for i := range texts {
+	// Longest first: a long text dispatched last would run alone while the
+	// other workers idle. Byte length is a cheap proxy for token count.
+	// Order affects only scheduling — every result is computed independently.
+	order := make([]int, len(texts))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return len(texts[order[a]]) > len(texts[order[b]]) })
+	for _, i := range order {
 		next <- i
 	}
 	close(next)
@@ -188,6 +199,50 @@ func (p *Provider) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 		}
 	}
 	return result, nil
+}
+
+// elasticKernel shares a batch's thread budget among its in-flight
+// forwards. Each call runs on total/min(workers, remaining) threads, read at
+// call time, so as the queue drains the last forwards (the longest, given
+// longest-first dispatch) widen onto the idle cores instead of finishing
+// single-threaded. Thread count never changes an output bit (the kernel
+// determinism contract), so this is invisible in results.
+type elasticKernel struct {
+	byThreads []Kernel // byThreads[t] uses t threads, t in [1, total]
+	workers   int64
+	remaining atomic.Int64 // forwards not yet finished
+}
+
+func newElasticKernel(total, workers, n int) *elasticKernel {
+	e := &elasticKernel{byThreads: make([]Kernel, total+1), workers: int64(workers)}
+	for t := 1; t <= total; t++ {
+		e.byThreads[t] = newKernel(t)
+	}
+	e.remaining.Store(int64(n))
+	return e
+}
+
+func (e *elasticKernel) current() Kernel {
+	inFlight := max(1, min(e.workers, e.remaining.Load()))
+	return e.byThreads[max(1, int64(len(e.byThreads)-1)/inFlight)]
+}
+
+func (e *elasticKernel) MatMulT(dst, a, b []float32, m, n, k int, bias []float32) {
+	e.current().MatMulT(dst, a, b, m, n, k, bias)
+}
+
+func (e *elasticKernel) MatMulTF16(dst, a []float32, b []uint16, m, n, k int, bias []float32) {
+	e.current().MatMulTF16(dst, a, b, m, n, k, bias)
+}
+
+func (e *elasticKernel) MatMulTQ8(dst, a []float32, qb []int8, scales []float32, m, n, k int, bias []float32) {
+	e.current().(q8Kernel).MatMulTQ8(dst, a, qb, scales, m, n, k, bias)
+}
+
+func (e *elasticKernel) threadCount() int { return kernelThreads(e.current()) }
+
+func (e *elasticKernel) withThreads(n int) Kernel {
+	return e.byThreads[max(1, min(n, len(e.byThreads)-1))]
 }
 
 // Dimensions returns the configured output width.
