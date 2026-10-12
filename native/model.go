@@ -6,12 +6,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // Model is a loaded BERT-family encoder: config + float32 weights + kernel.
 //
-// Weights are read-only after Load; every EncodeTokens call allocates its own
-// scratch buffers, so a Model is safe for concurrent use.
+// Weights are read-only after Load; every EncodeTokens call takes its own
+// scratch buffers from a pool, so a Model is safe for concurrent use.
 //
 // Determinism: for a given pack and host, EncodeTokens is bit-deterministic
 // regardless of kernel thread count — every output element of every GEMM is
@@ -42,6 +43,8 @@ type Model struct {
 	// refused, never extrapolated), keeping concurrent use lock-free.
 	ropeCos []float32 // [effmaxseq, headDim/2]
 	ropeSin []float32
+
+	scratch sync.Pool // *forwardScratch, reused across forwards
 }
 
 // weightMat is a matrix in whichever dtype the pack stores: raw fp16 bits
@@ -363,8 +366,22 @@ func (m *Model) EncodeTokensKernel(ctx context.Context, ids []int, outDim int, k
 
 	seq, h := len(ids), cfg.HiddenSize
 
+	// Attention runs head-parallel when the kernel has threads to spare and
+	// each head's GEMMs are too small to parallelize on their own (typical
+	// embedding lengths); every head then runs its GEMMs on a serial copy of
+	// the kernel. Longer sequences keep heads serial with parallel GEMMs,
+	// which also bounds scratch to one head's seq² buffer.
+	threads := kernelThreads(kern)
+	attn := attnPlan{kern: kern, workers: 1}
+	if t, ok := kern.(threaded); ok && threads > 1 && seq*padSeq(seq)*m.headDim < minParallelWork {
+		attn.workers = min(threads, cfg.NumHeads)
+		attn.kern = t.withThreads(1)
+	}
+	scratch := m.getScratch(seq, attn.workers)
+	defer m.scratch.Put(scratch)
+
 	// ── Embeddings ──
-	x := make([]float32, seq*h)
+	x := scratch.x
 	for t, id := range ids {
 		row := x[t*h : t*h+h]
 		m.wordEmb.rowInto(row, id, h)
@@ -379,18 +396,26 @@ func (m *Model) EncodeTokensKernel(ctx context.Context, ids []int, outDim int, k
 	layerNormRows(x, seq, h, m.embNormW, m.embNormB, eps)
 
 	// ── Transformer stack (post-norm) ──
-	scratch := newForwardScratch(seq, h, cfg.IntermediateSize, cfg.NumHeads, m.headDim)
 	for li := range m.layers {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := m.layerForward(ctx, kern, x, seq, &m.layers[li], scratch); err != nil {
+		// CLS pooling reads only row 0 of the final hidden state, so the
+		// last layer computes just that query row: keys and values still
+		// span the whole sequence, and row 0 is bit-identical to a full-row
+		// pass (each output element is the same serial dot product).
+		rows := seq
+		if li == len(m.layers)-1 && cfg.Pooling == PoolCLS {
+			rows = 1
+		}
+		if err := m.layerForward(ctx, kern, attn, threads, x, seq, rows, &m.layers[li], scratch); err != nil {
 			return nil, err
 		}
 	}
 
 	// ── Pooling ──
-	pooled := make([]float32, h)
+	pooled := scratch.pooled
+	clear(pooled)
 	switch cfg.Pooling {
 	case PoolCLS:
 		copy(pooled, x[:h])
@@ -432,108 +457,146 @@ func (m *Model) EncodeTokensKernel(ctx context.Context, ids []int, outDim int, k
 }
 
 // forwardScratch holds per-call buffers so concurrent EncodeTokens calls
-// never share mutable state.
+// never share mutable state. Each forward takes one from the Model's pool
+// and returns it when done, so steady-state embedding allocates only the
+// output vector. Every buffer is fully overwritten before it is read.
 //
 // Allocation bound: seq is validated ≤ EffectiveMaxSeqLen before scratch is
-// created (the HIGH-2 trained-context clamp), so the dominant seq² and
+// sized (the HIGH-2 trained-context clamp), so the dominant seq² and
 // seq×inter buffers are capped — nomic at 2048: ~16MB scores + ~25MB per FFN
 // buffer per in-flight forward — and EmbedBatch bounds in-flight forwards to
 // its worker-pool size. A declared-8192 forward (~268MB scores alone) is
-// unreachable.
+// unreachable. Pooled buffers are released by the GC like any sync.Pool.
 type forwardScratch struct {
-	qkv     []float32 // [seq, 3h]
-	q, k, v []float32 // [seq, headDim] per-head staging
-	vT      []float32 // [headDim, seq]
-	scores  []float32 // [seq, seq]
-	headOut []float32 // [seq, headDim]
-	attnCat []float32 // [seq, h]
-	attnOut []float32 // [seq, h]
-	ffnH    []float32 // [seq, inter]
-	ffnGate []float32 // [seq, inter] (swiglu)
-	ffnOut  []float32 // [seq, h]
+	x       []float32     // [seq, h] hidden state
+	pooled  []float32     // [h]
+	qkv     []float32     // [seq, 3h]
+	heads   []headScratch // one per attention worker
+	attnCat []float32     // [seq, h]
+	attnOut []float32     // [seq, h]
+	ffnH    []float32     // [seq, inter]
+	ffnGate []float32     // [seq, inter] (swiglu only)
+	ffnOut  []float32     // [seq, h]
 }
 
-func newForwardScratch(seq, h, inter, heads, headDim int) *forwardScratch {
-	return &forwardScratch{
-		qkv:     make([]float32, seq*3*h),
-		q:       make([]float32, seq*headDim),
-		k:       make([]float32, seq*headDim),
-		v:       make([]float32, seq*headDim),
-		vT:      make([]float32, headDim*seq),
-		scores:  make([]float32, seq*seq),
-		headOut: make([]float32, seq*headDim),
-		attnCat: make([]float32, seq*h),
-		attnOut: make([]float32, seq*h),
-		ffnH:    make([]float32, seq*inter),
-		ffnGate: make([]float32, seq*inter),
-		ffnOut:  make([]float32, seq*h),
+// headScratch is one attention worker's per-head staging.
+type headScratch struct {
+	q       []float32 // [seq, headDim]
+	k       []float32 // [padSeq(seq), headDim]
+	vT      []float32 // [headDim, padSeq(seq)]
+	scores  []float32 // [seq, padSeq(seq)]
+	headOut []float32 // [seq, headDim]
+}
+
+// attnPlan says how a forward runs attention: on workers goroutines (1 =
+// serial over heads), with kern for the per-head GEMMs.
+type attnPlan struct {
+	kern    Kernel
+	workers int
+}
+
+// getScratch returns pooled scratch sized for a seq-token forward with
+// headWorkers attention workers.
+func (m *Model) getScratch(seq, headWorkers int) *forwardScratch {
+	s, _ := m.scratch.Get().(*forwardScratch)
+	if s == nil {
+		s = &forwardScratch{}
 	}
+	h, inter, hd := m.cfg.HiddenSize, m.cfg.IntermediateSize, m.headDim
+	s.x = grow(s.x, seq*h)
+	s.pooled = grow(s.pooled, h)
+	s.qkv = grow(s.qkv, seq*3*h)
+	kp := padSeq(seq)
+	for len(s.heads) < headWorkers {
+		s.heads = append(s.heads, headScratch{})
+	}
+	for i := range s.heads[:headWorkers] {
+		hs := &s.heads[i]
+		hs.q = grow(hs.q, seq*hd)
+		hs.k = grow(hs.k, kp*hd)
+		hs.vT = grow(hs.vT, hd*kp)
+		hs.scores = grow(hs.scores, seq*kp)
+		hs.headOut = grow(hs.headOut, seq*hd)
+	}
+	s.attnCat = grow(s.attnCat, seq*h)
+	s.attnOut = grow(s.attnOut, seq*h)
+	s.ffnH = grow(s.ffnH, seq*inter)
+	if m.cfg.Activation == ActSwiGLU {
+		s.ffnGate = grow(s.ffnGate, seq*inter)
+	}
+	s.ffnOut = grow(s.ffnOut, seq*h)
+	return s
+}
+
+// padSeq rounds a sequence length up to the attention GEMMs' k block (8).
+func padSeq(seq int) int { return (seq + 7) &^ 7 }
+
+// grow returns buf resliced to n elements, reallocating only when it is too
+// small. Contents are unspecified.
+func grow(buf []float32, n int) []float32 {
+	if cap(buf) < n {
+		return make([]float32, n)
+	}
+	return buf[:n]
 }
 
 // layerForward applies one post-norm transformer block to x in place.
+// Keys and values span all seq rows; queries — and so every output — cover
+// only the first rows rows (rows < seq lets CLS pooling skip the unread rows
+// of the last layer). threads is the budget for the elementwise activation.
 // ctx is re-checked between attention and FFN (LOW-3): at trained-context
 // sequence lengths a single layer is long enough that per-layer checks alone
 // leave cancellation latency in the seconds.
-func (m *Model) layerForward(ctx context.Context, kern Kernel, x []float32, seq int, lw *layerWeights, s *forwardScratch) error {
+func (m *Model) layerForward(ctx context.Context, kern Kernel, attn attnPlan, threads int, x []float32, seq, rows int, lw *layerWeights, s *forwardScratch) error {
 	cfg := m.cfg
 	h := cfg.HiddenSize
-	hd := m.headDim
-	half := hd / 2
-	scale := float32(1.0 / math.Sqrt(float64(hd)))
 
 	// qkv = x·Wqkvᵀ (+bias): [seq, 3h], laid out q(heads-major) | k | v.
 	mmT(kern, s.qkv, x, lw.qkvW, seq, 3*h, h, lw.qkvB)
 
-	// Attention per head.
-	for head := 0; head < cfg.NumHeads; head++ {
-		if err := ctx.Err(); err != nil {
+	// Attention. Each head writes its own columns of attnCat, so workers
+	// never share an output. Heads are handed out from this goroutine, which
+	// keeps the per-head cancellation checkpoint (LOW-3) in one place.
+	if attn.workers == 1 {
+		for head := 0; head < cfg.NumHeads; head++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			m.attendHead(attn.kern, &s.heads[0], s, head, seq, rows, head == 0)
+		}
+	} else {
+		next := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < attn.workers; w++ {
+			wg.Add(1)
+			go func(hs *headScratch) {
+				defer wg.Done()
+				first := true
+				for head := range next {
+					m.attendHead(attn.kern, hs, s, head, seq, rows, first)
+					first = false
+				}
+			}(&s.heads[w])
+		}
+		var err error
+		for head := 0; head < cfg.NumHeads; head++ {
+			if err = ctx.Err(); err != nil {
+				break
+			}
+			next <- head
+		}
+		close(next)
+		wg.Wait()
+		if err != nil {
 			return err
-		}
-		qOff := head * hd
-		kOff := h + head*hd
-		vOff := 2*h + head*hd
-		for t := 0; t < seq; t++ {
-			row := s.qkv[t*3*h:]
-			copy(s.q[t*hd:t*hd+hd], row[qOff:qOff+hd])
-			copy(s.k[t*hd:t*hd+hd], row[kOff:kOff+hd])
-			copy(s.v[t*hd:t*hd+hd], row[vOff:vOff+hd])
-		}
-
-		if cfg.PositionEncoding == PosRoPE {
-			// NeoX-style half rotation over the full head dim, matching
-			// nomic's apply_rotary_emb (non-interleaved).
-			for t := 0; t < seq; t++ {
-				cosRow := m.ropeCos[t*half : t*half+half]
-				sinRow := m.ropeSin[t*half : t*half+half]
-				rotateHalf(s.q[t*hd:t*hd+hd], cosRow, sinRow, half)
-				rotateHalf(s.k[t*hd:t*hd+hd], cosRow, sinRow, half)
-			}
-		}
-
-		// scores = q·kᵀ / √d, softmax rows.
-		kern.MatMulT(s.scores, s.q, s.k, seq, seq, hd, nil)
-		for t := 0; t < seq; t++ {
-			softmaxScaled(s.scores[t*seq:t*seq+seq], scale)
-		}
-
-		// headOut = probs·v via probs·(vᵀ)ᵀ.
-		for t := 0; t < seq; t++ {
-			for d := 0; d < hd; d++ {
-				s.vT[d*seq+t] = s.v[t*hd+d]
-			}
-		}
-		kern.MatMulT(s.headOut, s.scores, s.vT, seq, hd, seq, nil)
-
-		for t := 0; t < seq; t++ {
-			copy(s.attnCat[t*h+head*hd:t*h+head*hd+hd], s.headOut[t*hd:t*hd+hd])
 		}
 	}
 
 	// Output projection, residual, norm1.
-	mmT(kern, s.attnOut, s.attnCat, lw.outW, seq, h, h, lw.outB)
-	addInto(s.attnOut, x[:seq*h])
-	copy(x[:seq*h], s.attnOut)
-	layerNormRows(x, seq, h, lw.norm1W, lw.norm1B, float32(cfg.LayerNormEps))
+	mmT(kern, s.attnOut, s.attnCat, lw.outW, rows, h, h, lw.outB)
+	addInto(s.attnOut[:rows*h], x[:rows*h])
+	copy(x[:rows*h], s.attnOut)
+	layerNormRows(x, rows, h, lw.norm1W, lw.norm1B, float32(cfg.LayerNormEps))
 
 	// Cancellation point between attention and FFN: the FFN GEMMs are the
 	// other half of a layer's work.
@@ -545,26 +608,96 @@ func (m *Model) layerForward(ctx context.Context, kern Kernel, x []float32, seq 
 	inter := cfg.IntermediateSize
 	switch cfg.Activation {
 	case ActGELU:
-		mmT(kern, s.ffnH, x, lw.fc1W, seq, inter, h, lw.fc1B)
-		for i, v := range s.ffnH[:seq*inter] {
-			s.ffnH[i] = geluErf(v)
-		}
+		mmT(kern, s.ffnH, x, lw.fc1W, rows, inter, h, lw.fc1B)
+		parallelChunks(rows*inter, threads, func(lo, hi int) {
+			for i, v := range s.ffnH[lo:hi] {
+				s.ffnH[lo+i] = geluF32(v)
+			}
+		})
 	case ActSwiGLU:
 		// nomic NomciBertGatedMLP: y = fc11(x) * silu(fc12(x)).
-		mmT(kern, s.ffnH, x, lw.fc1W, seq, inter, h, lw.fc1B)
-		mmT(kern, s.ffnGate, x, lw.gateW, seq, inter, h, lw.gateB)
-		for i := range s.ffnH[:seq*inter] {
-			g := s.ffnGate[i]
-			s.ffnH[i] *= g * sigmoid(g)
-		}
+		mmT(kern, s.ffnH, x, lw.fc1W, rows, inter, h, lw.fc1B)
+		mmT(kern, s.ffnGate, x, lw.gateW, rows, inter, h, lw.gateB)
+		parallelChunks(rows*inter, threads, func(lo, hi int) {
+			for i := lo; i < hi; i++ {
+				g := s.ffnGate[i]
+				s.ffnH[i] *= g * sigmoidF32(g)
+			}
+		})
 	}
-	mmT(kern, s.ffnOut, s.ffnH, lw.fc2W, seq, h, inter, lw.fc2B)
+	mmT(kern, s.ffnOut, s.ffnH, lw.fc2W, rows, h, inter, lw.fc2B)
 
 	// Residual, norm2.
-	addInto(s.ffnOut, x[:seq*h])
-	copy(x[:seq*h], s.ffnOut)
-	layerNormRows(x, seq, h, lw.norm2W, lw.norm2B, float32(cfg.LayerNormEps))
+	addInto(s.ffnOut[:rows*h], x[:rows*h])
+	copy(x[:rows*h], s.ffnOut)
+	layerNormRows(x, rows, h, lw.norm2W, lw.norm2B, float32(cfg.LayerNormEps))
 	return nil
+}
+
+// attendHead computes one attention head from s.qkv into its columns of
+// s.attnCat, staging through hs. first marks the first head this hs serves
+// in the layer, which clears the key-axis padding.
+//
+// The key axis is zero-padded to a multiple of 8 so both attention GEMMs run
+// whole SIMD blocks: padded key rows score 0, their probabilities are
+// cleared after the softmax, and the matching zero columns of vᵀ add exact
+// zeros to the output. No head writes the padding, so clearing it once per
+// layer per worker suffices.
+func (m *Model) attendHead(kern Kernel, hs *headScratch, s *forwardScratch, head, seq, rows int, first bool) {
+	cfg := m.cfg
+	h := cfg.HiddenSize
+	hd := m.headDim
+	half := hd / 2
+	scale := float32(1.0 / math.Sqrt(float64(hd)))
+	kp := padSeq(seq)
+	if first {
+		clear(hs.k[seq*hd : kp*hd])
+		for d := 0; d < hd; d++ {
+			clear(hs.vT[d*kp+seq : d*kp+kp])
+		}
+	}
+
+	qOff := head * hd
+	kOff := h + head*hd
+	vOff := 2*h + head*hd
+	for t := 0; t < seq; t++ {
+		row := s.qkv[t*3*h:]
+		if t < rows {
+			copy(hs.q[t*hd:t*hd+hd], row[qOff:qOff+hd])
+		}
+		copy(hs.k[t*hd:t*hd+hd], row[kOff:kOff+hd])
+		for d, v := range row[vOff : vOff+hd] {
+			hs.vT[d*kp+t] = v
+		}
+	}
+
+	if cfg.PositionEncoding == PosRoPE {
+		// NeoX-style half rotation over the full head dim, matching
+		// nomic's apply_rotary_emb (non-interleaved).
+		for t := 0; t < seq; t++ {
+			cosRow := m.ropeCos[t*half : t*half+half]
+			sinRow := m.ropeSin[t*half : t*half+half]
+			if t < rows {
+				rotateHalf(hs.q[t*hd:t*hd+hd], cosRow, sinRow, half)
+			}
+			rotateHalf(hs.k[t*hd:t*hd+hd], cosRow, sinRow, half)
+		}
+	}
+
+	// scores = q·kᵀ / √d, softmax rows.
+	kern.MatMulT(hs.scores, hs.q, hs.k, rows, kp, hd, nil)
+	for t := 0; t < rows; t++ {
+		row := hs.scores[t*kp : t*kp+kp]
+		softmaxScaled(row[:seq], scale)
+		clear(row[seq:])
+	}
+
+	// headOut = probs·v via probs·(vᵀ)ᵀ.
+	kern.MatMulT(hs.headOut, hs.scores, hs.vT, rows, hd, kp, nil)
+
+	for t := 0; t < rows; t++ {
+		copy(s.attnCat[t*h+head*hd:t*h+head*hd+hd], hs.headOut[t*hd:t*hd+hd])
+	}
 }
 
 // rotateHalf applies the NeoX rotation in place:
@@ -579,16 +712,23 @@ func rotateHalf(x, cos, sin []float32, half int) {
 }
 
 // softmaxScaled computes softmax(row·scale) in place with max subtraction.
+// scale > 0, so max(row)·scale is the max of the scaled row. The
+// denominator accumulates in float64 over a fixed order.
 func softmaxScaled(row []float32, scale float32) {
-	maxV := float32(math.Inf(-1))
-	for _, v := range row {
-		if v*scale > maxV {
-			maxV = v * scale
+	maxV := row[0]
+	for _, v := range row[1:] {
+		if v > maxV {
+			maxV = v
 		}
 	}
+	maxV *= scale
 	var sum float64
 	for i, v := range row {
-		e := float32(math.Exp(float64(v*scale - maxV)))
+		d := v*scale - maxV
+		if d < expClampLo {
+			d = expClampLo
+		}
+		e := expF32(d)
 		row[i] = e
 		sum += float64(e)
 	}
@@ -626,15 +766,6 @@ func layerNormRows(x []float32, rows, h int, weight, bias []float32, eps float32
 			}
 		}
 	}
-}
-
-// geluErf is the exact (erf-based) GELU used by HF's "gelu" activation.
-func geluErf(x float32) float32 {
-	return float32(0.5 * float64(x) * (1.0 + math.Erf(float64(x)/math.Sqrt2)))
-}
-
-func sigmoid(x float32) float32 {
-	return float32(1.0 / (1.0 + math.Exp(-float64(x))))
 }
 
 func addInto(dst, src []float32) {

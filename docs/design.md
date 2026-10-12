@@ -45,13 +45,17 @@ nomic is trained on 2048 positions but declares 8192; inputs are head-truncated 
 
 ## Kernels
 
-All dense math goes through the `Kernel` interface. Implementations: a blocked, goroutine-parallel pure-Go kernel; AVX2/FMA/F16C assembly on capable amd64 CPUs (fp16 weights converted in-register); NEON assembly on arm64. `FUTON_NATIVE_PUREGO=1` forces the portable kernel.
+All dense math goes through the `Kernel` interface. Implementations: a blocked, goroutine-parallel pure-Go kernel; AVX2/FMA/F16C assembly on capable amd64 CPUs (fp16 weights converted in-register); NEON assembly on arm64 (4×4 panels, sixteen accumulators, fp16 widened in-register). `FUTON_NATIVE_PUREGO=1` forces the portable kernel.
+
+The SIMD kernels split large GEMMs across threads by output column, so each worker streams only its slice of the weights; GEMMs under about two million multiply-adds run serially, since fan-out would cost more than it saves. When a forward's per-head attention GEMMs fall under that bound (typical embedding lengths), heads run in parallel instead, each on a serial copy of the kernel. The attention key axis is zero-padded to a multiple of eight so both attention GEMMs run whole SIMD blocks.
+
+Softmax, GELU and SiLU use float32 kernels (`native/mathf32.go`: exp within 1 ULP, GELU within 1e-6 absolute) rather than float64 `math` calls. For CLS-pooled packs the last layer computes only the CLS row, which is bit-identical to computing every row. Forward scratch buffers are pooled per model.
 
 Every kernel keeps one contract: thread count may decide which worker computes an output element, never the reduction order within one. Same input, same host, same kernel gives bit-identical output at any parallelism. Different kernels may round differently from each other; cross-kernel correctness is carried by the cosine parity gates.
 
 ## Batching
 
-Each text runs as its own unpadded forward pass, and `EmbedBatch` fans texts across a bounded worker pool. Without padding, padding cannot leak into attention or pooling by construction; batch and single results are bit-equal (pinned by test).
+Each text runs as its own unpadded forward pass, and `EmbedBatch` fans texts across a bounded worker pool, longest text first. The pool shares the thread budget elastically: each GEMM runs on the budget divided by the forwards still in flight, so as the queue drains the last (longest) texts spread onto the idle cores instead of finishing on one. Without padding, padding cannot leak into attention or pooling by construction; batch and single results are bit-equal (pinned by test), since thread count never changes an output bit.
 
 ## Verification
 
@@ -76,4 +80,12 @@ Parity against the pinned reference (cross-checked two independent ways at gener
 
 A model outside the pinned set, all-MiniLM-L6-v2 packed with `--repo`, scores a minimum of 0.999999 over 7 texts against sentence-transformers (including an over-long input clamped to its 256-token limit).
 
-Throughput on a 16-thread Windows machine, mixed-corpus batches: bge-small 210 ms/text on one thread and about 45 ms/text on all cores (about 1,560 tokens/s); nomic 590 ms/text on one thread and 165-250 ms/text on all cores (the all-core figure is noisy on a shared machine). Numbers will vary by CPU.
+Throughput on an Apple M4 Pro (14 cores), `EmbedBatch` over the 26-text parity corpus:
+
+| pack | one thread | all cores |
+|---|---|---|
+| bge-small-en-v1.5 | 54 ms/text | 12 ms/text |
+| nomic-embed-text-v1.5 | 218 ms/text | 30 ms/text |
+| snowflake-arctic-embed-m-long | 206 ms/text | 35 ms/text |
+
+Numbers will vary by CPU.

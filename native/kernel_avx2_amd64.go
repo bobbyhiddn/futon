@@ -33,7 +33,7 @@ func newArchKernel(threads int) Kernel {
 }
 
 // avx2Kernel implements Kernel with the assembly micro-kernels in
-// kernel_avx2_amd64.s. Same determinism contract as goKernel: thread count
+// kernel_avx2_amd64.s, split across threads by parallelTiles. Same determinism contract as goKernel: thread count
 // never changes any output bit (fixed lane accumulation + fixed reduction
 // sequence per element; scalar k-tails are added after the SIMD sum in a
 // fixed order).
@@ -41,10 +41,13 @@ type avx2Kernel struct {
 	threads int
 }
 
+func (g *avx2Kernel) threadCount() int         { return g.threads }
+func (g *avx2Kernel) withThreads(n int) Kernel { return &avx2Kernel{threads: n} }
+
 func (g *avx2Kernel) MatMulT(dst, a, b []float32, m, n, k int, bias []float32) {
 	checkGemmArgs(len(dst), len(a), len(b), m, n, k, bias)
 	k8 := k &^ 7
-	parallelRows(m, g.threads, 4, func(lo, hi int) {
+	parallelTiles(m, n, k, g.threads, 4, 2, func(lo, hi, c0, c1 int) {
 		var out [8]float32
 		for i := lo; i < hi; i += 4 {
 			last := hi - 1
@@ -53,9 +56,9 @@ func (g *avx2Kernel) MatMulT(dst, a, b []float32, m, n, k int, bias []float32) {
 			a2 := &a[min(i+2, last)*k]
 			a3 := &a[min(i+3, last)*k]
 			rows := min(4, hi-i)
-			for j := 0; j < n; j += 2 {
+			for j := c0; j < c1; j += 2 {
 				j1 := j + 1
-				if j1 >= n {
+				if j1 >= c1 {
 					j1 = j
 				}
 				if k8 > 0 {
@@ -89,7 +92,7 @@ func (g *avx2Kernel) MatMulT(dst, a, b []float32, m, n, k int, bias []float32) {
 func (g *avx2Kernel) MatMulTF16(dst, a []float32, b []uint16, m, n, k int, bias []float32) {
 	checkGemmArgs(len(dst), len(a), len(b), m, n, k, bias)
 	k8 := k &^ 7
-	parallelRows(m, g.threads, 4, func(lo, hi int) {
+	parallelTiles(m, n, k, g.threads, 4, 2, func(lo, hi, c0, c1 int) {
 		var out [8]float32
 		for i := lo; i < hi; i += 4 {
 			last := hi - 1
@@ -98,9 +101,9 @@ func (g *avx2Kernel) MatMulTF16(dst, a []float32, b []uint16, m, n, k int, bias 
 			a2 := &a[min(i+2, last)*k]
 			a3 := &a[min(i+3, last)*k]
 			rows := min(4, hi-i)
-			for j := 0; j < n; j += 2 {
+			for j := c0; j < c1; j += 2 {
 				j1 := j + 1
-				if j1 >= n {
+				if j1 >= c1 {
 					j1 = j
 				}
 				if k8 > 0 {

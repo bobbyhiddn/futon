@@ -62,7 +62,7 @@ The embedder itself never downloads anything: an application that ships its own 
 
 Supported: plain BERT encoders (WordPiece vocab, absolute positions, GELU) with CLS or mean pooling, and the nomic-bert variant (RoPE, SwiGLU). Not supported: GPU, training, decoder/LLM models, SentencePiece or BPE tokenizers (so no multilingual-e5 or other XLM-R models), and anything that is not an encoder.
 
-Speed depends on your CPU. On a 16-thread Windows machine bge-small embeds a mixed-content text in about 45-50 ms using all cores; run `go test ./native -bench Native` with a pack installed to measure your own hardware.
+Speed depends on your CPU. On an Apple M4 Pro (14 cores), embedding the mixed-content parity corpus with `EmbedBatch` takes about 12 ms per text for bge-small and 30-35 ms for nomic and arctic, or 54 ms and 205-220 ms on a single thread; run `go test ./native -bench Native` with a pack installed to measure your own hardware.
 
 ## Command line
 
@@ -117,6 +117,10 @@ FUTON_NATIVE_TEST_MODELS=./models go test ./native -run Parity -v
 ```
 
 Requires Go 1.23 or newer.
+
+## Acknowledgements
+
+Several of the engine's performance techniques (the float32 exp kernel, column-split GEMM threading, the 16-accumulator NEON panel, CLS-only final layer, head-parallel attention) are adapted from [aikit](https://github.com/townsendmerino/aikit) by Francis Townsend-Merino, under the MIT License. See [NOTICE](NOTICE).
 
 ## License
 

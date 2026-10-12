@@ -88,6 +88,87 @@ func parallelRows(m, threads, blockRows int, fn func(lo, hi int)) {
 	wg.Wait()
 }
 
+// minParallelWork is the GEMM size (m·n·k multiply-adds) below which
+// parallelTiles runs serially: fanning goroutines out over a few tens of
+// microseconds of work costs more than it saves. Per-head attention GEMMs
+// at typical sequence lengths fall under it.
+const minParallelWork = 1 << 21
+
+// parallelTiles partitions the m×n output into blocks aligned to blockRows
+// and blockCols and runs fn(i0, i1, j0, j1) on each. When there are enough
+// column blocks to balance across threads it splits columns, so each worker
+// streams only its slice of b (the weights) — a row split makes every
+// worker re-read all of b, which dominates at embedding-length m. Otherwise
+// it falls back to parallelRows. (The column split follows aikit's
+// encoder/parallel.go, github.com/townsendmerino/aikit, MIT; see NOTICE.)
+// Either way each output element is computed whole by one worker, so the
+// determinism contract holds.
+func parallelTiles(m, n, k, threads, blockRows, blockCols int, fn func(i0, i1, j0, j1 int)) {
+	if threads <= 1 || m*n*k < minParallelWork {
+		fn(0, m, 0, n)
+		return
+	}
+	colBlocks := (n + blockCols - 1) / blockCols
+	if colBlocks < 2*threads {
+		parallelRows(m, threads, blockRows, func(lo, hi int) { fn(lo, hi, 0, n) })
+		return
+	}
+	chunk := (colBlocks + threads - 1) / threads * blockCols
+	var wg sync.WaitGroup
+	for j0 := 0; j0 < n; j0 += chunk {
+		j1 := min(j0+chunk, n)
+		wg.Add(1)
+		go func(j0, j1 int) {
+			defer wg.Done()
+			fn(0, m, j0, j1)
+		}(j0, j1)
+	}
+	wg.Wait()
+}
+
+// threaded is implemented by every built-in kernel. It exposes the thread
+// budget, so the forward can also parallelize work outside the GEMMs, and
+// makes a same-implementation copy with another budget (head-parallel
+// attention runs its small inner GEMMs on serial copies). A Kernel without
+// it is treated as serial for everything outside its own GEMMs.
+type threaded interface {
+	threadCount() int
+	withThreads(n int) Kernel
+}
+
+// kernelThreads returns kern's thread budget, 1 if it does not say.
+func kernelThreads(kern Kernel) int {
+	if t, ok := kern.(threaded); ok {
+		return t.threadCount()
+	}
+	return 1
+}
+
+// minParallelElems is the elementwise-loop size (activations) below which
+// parallelChunks runs serially.
+const minParallelElems = 1 << 14
+
+// parallelChunks splits [0,n) into up to threads contiguous chunks of at
+// least minParallelElems and runs fn on each.
+func parallelChunks(n, threads int, fn func(lo, hi int)) {
+	threads = min(threads, n/minParallelElems)
+	if threads <= 1 {
+		fn(0, n)
+		return
+	}
+	chunk := (n + threads - 1) / threads
+	var wg sync.WaitGroup
+	for lo := 0; lo < n; lo += chunk {
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			fn(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
 func checkGemmArgs(lenDst, lenA, lenB int, m, n, k int, bias []float32) {
 	if lenA < m*k || lenB < n*k || lenDst < m*n {
 		panic("native: MatMulT buffer smaller than declared shape")
@@ -106,6 +187,9 @@ func checkGemmArgs(lenDst, lenA, lenB int, m, n, k int, bias []float32) {
 type goKernel struct {
 	threads int
 }
+
+func (g *goKernel) threadCount() int         { return g.threads }
+func (g *goKernel) withThreads(n int) Kernel { return &goKernel{threads: n} }
 
 func (g *goKernel) MatMulT(dst, a, b []float32, m, n, k int, bias []float32) {
 	checkGemmArgs(len(dst), len(a), len(b), m, n, k, bias)

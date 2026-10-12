@@ -213,3 +213,45 @@ func TestArchKernelDeterministicAcrossThreads(t *testing.T) {
 		}
 	}
 }
+
+// TestKernelParallelSplits covers GEMMs above minParallelWork, where
+// parallelTiles actually fans out: a wide output (column split) and a tall,
+// narrow one (row split). Each must match the reference and be
+// bit-identical to the serial result at every thread count, in f32 and f16.
+func TestKernelParallelSplits(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	shapes := []struct{ m, n, k int }{
+		{37, 203, 300}, // 51 column blocks: column split up to 25 threads
+		{301, 13, 600}, // 4 column blocks: row split
+	}
+	for _, sh := range shapes {
+		if sh.m*sh.n*sh.k < minParallelWork {
+			t.Fatalf("shape %+v is below minParallelWork; test would not exercise the split", sh)
+		}
+		a := randSlice(rng, sh.m*sh.k)
+		b := randSlice(rng, sh.n*sh.k)
+		b16 := f16Bits(b)
+		bias := randSlice(rng, sh.n)
+		want := naiveMatMulT(a, b, sh.m, sh.n, sh.k, bias)
+		ref := make([]float32, sh.m*sh.n)
+		ref16 := make([]float32, sh.m*sh.n)
+		newKernel(1).MatMulT(ref, a, b, sh.m, sh.n, sh.k, bias)
+		newKernel(1).MatMulTF16(ref16, a, b16, sh.m, sh.n, sh.k, bias)
+		for i := range want {
+			if diff := math.Abs(float64(ref[i] - want[i])); diff > 1e-3 {
+				t.Fatalf("shape %+v: element %d = %v, want %v", sh, i, ref[i], want[i])
+			}
+		}
+		for _, threads := range []int{2, 3, 8, 14, 64} {
+			got := make([]float32, sh.m*sh.n)
+			got16 := make([]float32, sh.m*sh.n)
+			newKernel(threads).MatMulT(got, a, b, sh.m, sh.n, sh.k, bias)
+			newKernel(threads).MatMulTF16(got16, a, b16, sh.m, sh.n, sh.k, bias)
+			for i := range ref {
+				if got[i] != ref[i] || got16[i] != ref16[i] {
+					t.Fatalf("shape %+v threads=%d: element %d differs bitwise from serial", sh, threads, i)
+				}
+			}
+		}
+	}
+}
